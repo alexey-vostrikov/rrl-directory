@@ -324,9 +324,19 @@ pub fn object_category(classes: &[String], base_dn: &str) -> Option<String> {
     let categories = object_categories();
     for class in classes.iter().rev() {
         if let Some(category) = categories.get(&class.to_ascii_lowercase()) {
-            // AD's value names the schema's own host (`DC=X` in the published file). Here that host is
-            // this domain's configuration partition, which is where the class really is.
-            return Some(format!("{category},{base_dn}").replace("DC=X,", &format!("{base_dn},")));
+            // AD's value ends with the schema's own host, `DC=X` in the published file. Here that
+            // host is this domain's naming context: `CN=Person,CN=Schema,CN=Configuration,DC=X`
+            // becomes `CN=Person,CN=Schema,CN=Configuration,dc=ad,dc=example,dc=com`.
+            //
+            // The replacement is of the **tail**, not of `DC=X,`: the host is the last component and
+            // carries no comma, and replacing `DC=X,` matched nothing - which produced a value with
+            // the domain glued on twice, `…,dc=ad,dc=example,dc=com,dc=ad,dc=example,dc=com`, and a
+            // `objectCategory` no client can resolve to a class.
+            return Some(match category.strip_suffix("DC=X") {
+                Some(prefix) => format!("{prefix}{base_dn}"),
+                // A category that names no host is already absolute and is left alone.
+                None => category.clone(),
+            });
         }
     }
     None
@@ -491,6 +501,18 @@ mod tests {
         assert!(
             category.ends_with("dc=ad,dc=example,dc=com"),
             "and it points into this domain's configuration partition: {category}"
+        );
+        // Once, not twice: the host AD publishes as `DC=X` is the tail of the value, and a
+        // replacement of `DC=X,` matched nothing and produced `…,dc=ad,dc=example,dc=com` glued
+        // onto a value that already ended with it - a DN no client resolves to a class.
+        assert_eq!(
+            category.matches("dc=ad,dc=example,dc=com").count(),
+            1,
+            "the naming context appears once: {category}"
+        );
+        assert_eq!(
+            category,
+            "CN=Computer,CN=Schema,CN=Configuration,dc=ad,dc=example,dc=com"
         );
 
         let user = ["top".to_string(), "person".to_string(), "user".to_string()];

@@ -657,7 +657,7 @@ async fn serve() {
                 // domain's own `crossRef` under it, and a client looks the context up by that name.
                 netbios: realm.split('.').next().unwrap_or("AD").to_ascii_uppercase(),
             };
-            match partition.ensure(&backend).await {
+            match partition.ensure(&backend, &config.schema).await {
                 Ok(created) if !created.is_empty() => {
                     eprintln!("provision: created {}", created.join(", "));
                 }
@@ -797,7 +797,7 @@ async fn serve() {
             // day the zone was created, and a secondary compares numbers rather than dates.
             serial: zone_serial(),
         };
-        match rrl_directory::dns::provision::ensure(&backend, &facts).await {
+        match rrl_directory::dns::provision::ensure(&backend, &facts, &config.schema).await {
             Ok(created) if !created.is_empty() => {
                 eprintln!(
                     "provision: created the zone's {} entry/entries",

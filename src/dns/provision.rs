@@ -166,7 +166,11 @@ const LOCATORS: &[(&str, &[(u16, ())])] = &[
 ///
 /// Only the entries that are absent are written: an operator who has edited a record keeps it. A zone
 /// that rewrote itself on every start would undo exactly the changes a directory is for.
-pub async fn ensure(backend: &Backend, facts: &Facts) -> Result<Vec<String>, String> {
+pub async fn ensure(
+    backend: &Backend,
+    facts: &Facts,
+    schema: &crate::schema::Schema,
+) -> Result<Vec<String>, String> {
     let Some(entries) = entries(facts) else {
         return Err(format!(
             "'{}' is not inside '{}': a zone whose records name a host it does not hold sends every \
@@ -194,6 +198,10 @@ pub async fn ensure(backend: &Backend, facts: &Facts) -> Result<Vec<String>, Str
             continue;
         }
         let dn = entry.dn().to_string();
+        // Stored the way the write funnel stores an entry: AD's `top` class requires
+        // `objectCategory`, `instanceType` and `nTSecurityDescriptor`, and a zone node written
+        // without them is a node the schema this directory publishes refuses to read back.
+        let entry = crate::provision::stored(schema, &facts.base_dn, entry);
         backend
             .apply(&[EntryChange::Upsert { entry }])
             .await

@@ -140,7 +140,11 @@ impl Partition {
     }
 
     /// Creates the ones that are missing, and says which it created.
-    pub async fn ensure(&self, backend: &Backend) -> Result<Vec<String>, String> {
+    pub async fn ensure(
+        &self,
+        backend: &Backend,
+        schema: &crate::schema::Schema,
+    ) -> Result<Vec<String>, String> {
         let existing: Vec<String> = backend
             .load()
             .await
@@ -151,7 +155,7 @@ impl Partition {
             .collect();
 
         let mut created = Vec::new();
-        for entry in self.storable(&crate::schema::Schema::core()) {
+        for entry in self.storable(schema) {
             if existing
                 .iter()
                 .any(|have| have.eq_ignore_ascii_case(entry.dn()))

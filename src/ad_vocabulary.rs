@@ -282,6 +282,56 @@ fn push_list(out: &mut String, keyword: &str, values: &[&str]) {
     }
 }
 
+/// The `defaultObjectCategory` of every class, by LDAP display name.
+///
+/// AD does not leave `objectCategory` to the writer: the class schema names the category its
+/// instances belong to, and every object an AD controller creates carries it. The value is a DN into
+/// the configuration partition - `CN=Person,CN=Schema,CN=Configuration,…` for a user, and
+/// `CN=Computer,…` for a machine - which is why `user`'s is `Person` and not `User`: the category is
+/// the class whose `defaultObjectCategory` the schema points at, and AD points users at `Person`.
+///
+/// Parsed once: the file is 1,300 entries and this is asked for on every object this server creates.
+pub fn object_categories() -> &'static BTreeMap<String, String> {
+    static CACHE: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut out = BTreeMap::new();
+        for entry in entries(CLASSES_LDF) {
+            let Some(name) = first(&entry, "ldapdisplayname") else {
+                continue;
+            };
+            let Some(category) = first(&entry, "defaultobjectcategory") else {
+                continue;
+            };
+            if category.is_empty() {
+                continue;
+            }
+            out.insert(name.to_ascii_lowercase(), category.to_string());
+        }
+        out
+    })
+}
+
+/// The `objectCategory` for an entry whose `objectClass` is `classes`, pointed at `base_dn`.
+///
+/// The class chain is walked from the most specific name downwards, because AD's `defaultObjectCategory`
+/// is set on the general class and inherited by name: an entry whose `objectClass` lists
+/// `top, person, organizationalPerson, user, computer` is a `Computer`, not a `Person`, and the first
+/// name that has a category wins.
+///
+/// `None` when no class in the list names one - an entry of ours that AD's schema does not describe.
+#[must_use]
+pub fn object_category(classes: &[String], base_dn: &str) -> Option<String> {
+    let categories = object_categories();
+    for class in classes.iter().rev() {
+        if let Some(category) = categories.get(&class.to_ascii_lowercase()) {
+            // AD's value names the schema's own host (`DC=X` in the published file). Here that host is
+            // this domain's configuration partition, which is where the class really is.
+            return Some(format!("{category},{base_dn}").replace("DC=X,", &format!("{base_dn},")));
+        }
+    }
+    None
+}
+
 /// Both vocabularies, ready for [`crate::schema::Schema::extend`].
 #[must_use]
 pub fn vocabulary() -> String {
@@ -369,6 +419,35 @@ mod tests {
         assert!(
             !line.contains("objectSid"),
             "objectSid reaches the class through samDomain, not by being listed: {line}"
+        );
+    }
+
+    /// `objectCategory` follows the class chain, and a computer is not a person.
+    #[test]
+    fn the_object_category_is_the_most_specific_class_that_names_one() {
+        let computer = [
+            "top".to_string(),
+            "person".to_string(),
+            "organizationalPerson".to_string(),
+            "user".to_string(),
+            "computer".to_string(),
+        ];
+        let category = object_category(&computer, "dc=ad,dc=example,dc=com")
+            .expect("a computer has a category");
+        assert!(
+            category.starts_with("CN=Computer,CN=Schema,CN=Configuration,"),
+            "the most specific class wins: {category}"
+        );
+        assert!(
+            category.ends_with("dc=ad,dc=example,dc=com"),
+            "and it points into this domain's configuration partition: {category}"
+        );
+
+        let user = ["top".to_string(), "person".to_string(), "user".to_string()];
+        let category = object_category(&user, "dc=ad,dc=example,dc=com").expect("a user has one");
+        assert!(
+            category.starts_with("CN=Person,CN=Schema,CN=Configuration,"),
+            "users belong to Person, which is what AD's schema says: {category}"
         );
     }
 

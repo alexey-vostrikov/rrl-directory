@@ -148,7 +148,9 @@ mod tests {
     /// Written here rather than mocked, because what is being tested is the exchange: the framing,
     /// the identifier, and the switch to TCP when the answer says it was truncated.
     async fn upstream(answer_ip: &'static str, truncate: bool) -> SocketAddr {
-        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("udp");
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp");
         let addr = udp.local_addr().expect("an address");
         let tcp = tokio::net::TcpListener::bind(addr).await.expect("tcp");
 
@@ -207,7 +209,7 @@ mod tests {
                 ));
             }
         }
-    
+
         if truncate {
             reply.metadata.truncation = true;
         }
@@ -259,7 +261,9 @@ mod tests {
         // A port nothing listens on: bound and dropped, so the address is syntactically real and
         // there is no server behind it.
         let dead = {
-            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("udp");
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("udp");
             let addr = socket.local_addr().expect("an address");
             drop(socket);
             addr
@@ -272,7 +276,9 @@ mod tests {
     #[tokio::test]
     async fn a_second_server_is_tried_when_the_first_is_silent() {
         let dead = {
-            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("udp");
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("udp");
             let addr = socket.local_addr().expect("an address");
             drop(socket);
             addr

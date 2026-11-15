@@ -93,7 +93,9 @@ impl Settings {
         })?;
         let port = config.port.unwrap_or(53);
         if port == 0 {
-            return Err("dns.port is 0: a listener cannot take a port the kernel chooses".to_string());
+            return Err(
+                "dns.port is 0: a listener cannot take a port the kernel chooses".to_string(),
+            );
         }
 
         let mut forward_zones = BTreeMap::new();
@@ -256,8 +258,8 @@ mod tests {
     /// The acceptance: a section with no disagreements resolves to what a listener needs.
     #[test]
     fn a_plain_section_resolves_to_the_domains_own_name() {
-        let settings = Settings::resolve(&config(), BASE, "127.0.0.1".parse().expect("ip"))
-            .expect("resolves");
+        let settings =
+            Settings::resolve(&config(), BASE, "127.0.0.1".parse().expect("ip")).expect("resolves");
         assert_eq!(settings.dns_domain, "ad.example.com");
         assert_eq!(settings.bind, ip("127.0.0.1:53"));
         assert_eq!(settings.zones_dir, PathBuf::from("/dns"));
@@ -328,7 +330,10 @@ mod tests {
         )
         .expect("resolves");
         assert_eq!(only_corp.forwarder_for("notcorp.example.com."), None);
-        assert_eq!(only_corp.forwarder_for("a.corp.example.com.").is_some(), true);
+        assert_eq!(
+            only_corp.forwarder_for("a.corp.example.com.").is_some(),
+            true
+        );
     }
 
     /// A suffix that is not a name, an empty suffix, one with no servers, and a port of zero: each
@@ -342,7 +347,10 @@ mod tests {
         assert!(Settings::resolve(&bad, BASE, "127.0.0.1".parse().expect("ip")).is_err());
 
         let mut empty = config();
-        empty.forward.zones.insert("corp.test".to_string(), Vec::new());
+        empty
+            .forward
+            .zones
+            .insert("corp.test".to_string(), Vec::new());
         assert!(Settings::resolve(&empty, BASE, "127.0.0.1".parse().expect("ip")).is_err());
 
         let mut no_port = config();
@@ -356,8 +364,8 @@ mod tests {
             .forward
             .zones
             .insert("corp.test".to_string(), vec![ip("192.0.2.1:53")]);
-        let resolved = Settings::resolve(&twice, BASE, "127.0.0.1".parse().expect("ip"))
-            .expect("resolves");
+        let resolved =
+            Settings::resolve(&twice, BASE, "127.0.0.1".parse().expect("ip")).expect("resolves");
         assert!(resolved.forward_zones.contains_key("corp.test"));
     }
 

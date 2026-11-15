@@ -420,10 +420,7 @@ pub async fn listen_from_directory(
     // The forwarder is told the bind address, because the settings come from the configuration and
     // the port may have been chosen by the kernel: a listener that reported a different address than
     // it took would be one nobody can find.
-    let forward = crate::dns::config::Settings {
-        bind,
-        ..forward
-    };
+    let forward = crate::dns::config::Settings { bind, ..forward };
     listen(bind, Answering::new(catalog, ours, forward)).await
 }
 
@@ -471,16 +468,25 @@ impl Answering {
 
 #[async_trait::async_trait]
 impl hickory_server::server::RequestHandler for Answering {
-    async fn handle_request<R: hickory_server::server::ResponseHandler, T: hickory_server::net::runtime::Time>(
+    async fn handle_request<
+        R: hickory_server::server::ResponseHandler,
+        T: hickory_server::net::runtime::Time,
+    >(
         &self,
         request: &Request,
         response_handle: R,
     ) -> hickory_server::server::ResponseInfo {
         let Some(query) = request.queries.queries().first() else {
-            return self.catalog.handle_request::<R, T>(request, response_handle).await;
+            return self
+                .catalog
+                .handle_request::<R, T>(request, response_handle)
+                .await;
         };
         if self.is_ours(query.name()) {
-            return self.catalog.handle_request::<R, T>(request, response_handle).await;
+            return self
+                .catalog
+                .handle_request::<R, T>(request, response_handle)
+                .await;
         }
         if !crate::dns::forward::is_forwardable(query.query_type()) {
             return answer_with(
@@ -554,9 +560,8 @@ async fn answer_with<R: hickory_server::server::ResponseHandler>(
 ) -> hickory_server::server::ResponseInfo {
     use hickory_server::zone_handler::MessageResponseBuilder;
 
-    let mut metadata = hickory_server::proto::op::Metadata::response_from_request(
-        &request.metadata,
-    );
+    let mut metadata =
+        hickory_server::proto::op::Metadata::response_from_request(&request.metadata);
     metadata.response_code = code;
     metadata.authoritative = false;
     // The recursion flag describes this server's own behaviour: it forwarded, so it was available.

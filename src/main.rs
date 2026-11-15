@@ -726,7 +726,10 @@ async fn serve() {
         };
         match rrl_directory::dns::provision::ensure(&backend, &facts).await {
             Ok(created) if !created.is_empty() => {
-                eprintln!("provision: created the zone's {} entry/entries", created.len())
+                eprintln!(
+                    "provision: created the zone's {} entry/entries",
+                    created.len()
+                )
             }
             Ok(_) => {}
             Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
@@ -1044,8 +1047,10 @@ async fn serve() {
                     match settings.forwarder_for(&settings.dns_domain) {
                         // The zone's own name is never forwarded, so this branch reports the
                         // *default* list when there is one and silence otherwise.
-                        _ if !settings.forward_default.is_empty() =>
-                            format!(", forwarding elsewhere to {}", settings.forward_default.len()),
+                        _ if !settings.forward_default.is_empty() => format!(
+                            ", forwarding elsewhere to {}",
+                            settings.forward_default.len()
+                        ),
                         _ if !settings.forward_zones.is_empty() =>
                             format!(", {} forwarded suffix(es)", settings.forward_zones.len()),
                         _ => ", refusing other names".to_string(),

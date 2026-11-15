@@ -26,7 +26,7 @@
 use std::net::Ipv4Addr;
 
 use crate::backend::{Backend, EntryChange};
-use crate::dns::record::{kind, Data, Record, Soa, Srv};
+use crate::dns::record::{Data, Record, Soa, Srv, kind};
 use crate::dns::zone::{self, APEX};
 use crate::model::Entry;
 
@@ -179,7 +179,11 @@ pub async fn ensure(backend: &Backend, facts: &Facts) -> Result<Vec<String>, Str
         .load()
         .await
         .map_err(|err| format!("the store could not be read: {err}"))?;
-    let existing: Vec<String> = data.entries.iter().map(|entry| entry.dn().to_owned()).collect();
+    let existing: Vec<String> = data
+        .entries
+        .iter()
+        .map(|entry| entry.dn().to_owned())
+        .collect();
 
     let mut created = Vec::new();
     for entry in entries {
@@ -219,12 +223,8 @@ mod tests {
     #[test]
     fn the_zone_derived_from_the_facts_answers_a_clients_first_questions() {
         let entries = entries(&facts()).expect("the host is inside the zone");
-        let directory = Directory::from_entries(
-            "dc=ad,dc=example,dc=com",
-            "users",
-            "groups",
-            entries,
-        );
+        let directory =
+            Directory::from_entries("dc=ad,dc=example,dc=com", "users", "groups", entries);
 
         let zone = zone::Zone::read(&directory, "dc=ad,dc=example,dc=com", "ad.example.com")
             .expect("the zone reads back");
@@ -254,10 +254,7 @@ mod tests {
             msdcs[0].contains("dc1.ad.example.com"),
             "it points at this server: {msdcs:?}"
         );
-        assert!(
-            msdcs[0].contains("389"),
-            "on the LDAP port: {msdcs:?}"
-        );
+        assert!(msdcs[0].contains("389"), "on the LDAP port: {msdcs:?}");
 
         for (owner, port) in [
             ("_kerberos._tcp.ad.example.com.", "88"),
@@ -268,16 +265,26 @@ mod tests {
         ] {
             let found = answers(owner);
             assert_eq!(found.len(), 1, "{owner} answers once: {found:?}");
-            assert!(found[0].contains(port), "{owner} names port {port}: {found:?}");
+            assert!(
+                found[0].contains(port),
+                "{owner} names port {port}: {found:?}"
+            );
         }
 
         // And nothing was left unanswerable: a record this build cannot render is one a client asks
         // for and does not get.
-        assert!(zone.unserved.is_empty(), "unserved types: {:?}", zone.unserved);
+        assert!(
+            zone.unserved.is_empty(),
+            "unserved types: {:?}",
+            zone.unserved
+        );
 
         // The zone object is where a directory client would look for it.
         let zone_dn = zone::zone_dn("dc=ad,dc=example,dc=com", "ad.example.com");
-        assert!(directory.record(&zone_dn).is_some(), "the zone object exists");
+        assert!(
+            directory.record(&zone_dn).is_some(),
+            "the zone object exists"
+        );
         let nodes = directory.scope_matches(&zone_dn, Scope::OneLevel, |_| true);
         assert!(
             nodes.len() >= 8,
@@ -310,12 +317,16 @@ mod tests {
             )
         };
         let read = |facts: &Facts| {
-            zone::Zone::read(&directory(facts), "dc=ad,dc=example,dc=com", "ad.example.com")
-                .expect("reads")
-                .records
-                .into_iter()
-                .find(|record| record.record_type() == hickory_server::proto::rr::RecordType::SOA)
-                .expect("a SOA")
+            zone::Zone::read(
+                &directory(facts),
+                "dc=ad,dc=example,dc=com",
+                "ad.example.com",
+            )
+            .expect("reads")
+            .records
+            .into_iter()
+            .find(|record| record.record_type() == hickory_server::proto::rr::RecordType::SOA)
+            .expect("a SOA")
         };
         assert_ne!(read(&facts()).data, read(&with_later).data);
     }

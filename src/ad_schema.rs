@@ -416,7 +416,8 @@ mod tests {
                 ))
                 .push(crate::model::Attribute::single("dc", "_ldap._tcp"))
                 .push(
-                    crate::model::Attribute::new("dnsRecord", vec!["AAECAw==".to_string()]).binary(),
+                    crate::model::Attribute::new("dnsRecord", vec!["AAECAw==".to_string()])
+                        .binary(),
                 ),
         );
         if let Err(violations) = schema.check(&node) {

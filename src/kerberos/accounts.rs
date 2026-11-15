@@ -196,6 +196,54 @@ impl MachineAccounts for DirectoryAccounts {
             .parse()
             .ok()
     }
+
+    /// Removes the machine account `account` from the directory.
+    ///
+    /// The counterpart of `create_machine`, called by `samr_DeleteUser` when a join undoes the
+    /// account it made. Only an account with a machine's own SID is removed: a delete that took any
+    /// entry by name would let a client remove a person by mistyping a handle.
+    async fn delete_machine(&self, account: &str) -> bool {
+        let Some(entry) = self.existing(account).await else {
+            tracing::info!(account, "samr: DeleteUser for an account that is not there");
+            return false;
+        };
+        let dn = entry.dn().to_string();
+        // `computer` or `user` with a machine SID: what `create_machine` writes, and what a join
+        // made over LDAP writes too. Anything else that happens to carry the name is left alone.
+        let machine = entry
+            .attributes()
+            .get(crate::model::ATTR_OBJECT_CLASS)
+            .is_some_and(|classes| {
+                classes.values.iter().any(|class| {
+                    ["computer", "user"].iter().any(|known| class.eq_ignore_ascii_case(known))
+                })
+            })
+            && entry.attributes().get("objectSid").is_some();
+        if !machine {
+            tracing::warn!(
+                account,
+                dn,
+                "samr: DeleteUser for an entry that is not a machine account"
+            );
+            return false;
+        }
+
+        match self
+            .source
+            .apply(&[crate::backend::EntryChange::delete(dn.clone(), None)])
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(account, dn, "samr: machine account removed");
+                true
+            }
+            Err(err) => {
+                tracing::warn!(account, dn, %err, "samr: the machine account could not be removed");
+                false
+            }
+        }
+    }
+
 }
 
 impl DirectoryAccounts {

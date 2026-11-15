@@ -969,6 +969,13 @@ fn begin(
     // `GSSAPI` (libsasl) keeps the round: it has one, and it needs the layer mask.
     let complete = mechanism.eq_ignore_ascii_case(SPNEGO_MECHANISM);
 
+    if std::env::var_os("RRL_SASL_HEX").is_some() {
+        eprintln!(
+            "sasl-reply: {}",
+            reply.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+    }
+
     session.set_sasl(Exchange {
         tokens,
         principal: context.client_principal.clone(),

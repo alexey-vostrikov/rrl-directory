@@ -698,8 +698,21 @@ fn finish(
             identity,
             diagnostic,
             wrap,
-            ntlm: _,
+            ntlm,
         }) => {
+            // The NTLM security layer, installed before the answer is written and installed by
+            // *this* function because every SASL round ends here. It used to be read by the Sicily
+            // path alone, and the Sicily path is the bare-`NTLM` one: a Windows client speaks
+            // `GSS-SPNEGO`, so its completed bind arrived with the key in `ntlm` and the layer was
+            // dropped on the floor.
+            //
+            // Measured on the AD-join stand: `ntlm: logon accepted` in the log, then
+            // `message is not a BER sequence (tag 0x00)` for the very next frame - the four-octet
+            // length of a sealed message read as a BER tag - and `Add-Computer` ended with
+            // "the specified network resource or device is no longer available".
+            if let Some((flags, key)) = ntlm {
+                session.install_ntlm_layer(flags, &key);
+            }
             if let Some(identity) = identity {
                 session.set_identity(identity);
                 session.clear_sasl();

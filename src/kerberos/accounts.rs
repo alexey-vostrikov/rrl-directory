@@ -215,7 +215,9 @@ impl MachineAccounts for DirectoryAccounts {
             .get(crate::model::ATTR_OBJECT_CLASS)
             .is_some_and(|classes| {
                 classes.values.iter().any(|class| {
-                    ["computer", "user"].iter().any(|known| class.eq_ignore_ascii_case(known))
+                    ["computer", "user"]
+                        .iter()
+                        .any(|known| class.eq_ignore_ascii_case(known))
                 })
             })
             && entry.attributes().get("objectSid").is_some();
@@ -243,7 +245,6 @@ impl MachineAccounts for DirectoryAccounts {
             }
         }
     }
-
 }
 
 impl DirectoryAccounts {

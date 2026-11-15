@@ -36,7 +36,44 @@ fn serves_a_domain(config: &config::Config) -> bool {
 ///
 /// `cldap.dns_host` first, because an operator who set it has decided the name. Otherwise the SMB
 /// name under the domain, and `localhost` when neither section says anything.
-#[cfg(feature = "kdc")]
+/// The zone's serial: `YYYYMMDDnn`, as AD and every zone file spell it.
+///
+/// `nn` is 01 because this server writes a serial once, at provisioning, and does not yet sign a zone
+/// or accept dynamic updates - when it does, the counter is what a secondary compares, and this is
+/// where it will live.
+#[cfg(feature = "dns")]
+fn zone_serial() -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    // Days since the epoch to a civil date, by the algorithm every calendar library uses; written out
+    // because a date format is not worth a dependency.
+    let days = (now / 86_400) as i64;
+    let (year, month, day) = civil_from_days(days);
+    (year as u32) * 1_000_000 + (month as u32) * 10_000 + (day as u32) * 100 + 1
+}
+
+/// Days since 1970-01-01 to `(year, month, day)`.
+///
+/// Howard Hinnant's `civil_from_days`, which is the short form of the arithmetic every standard
+/// library hides: it is exact for every date this server can meet and has no leap-second special
+/// case, because a zone serial does not need one.
+#[cfg(feature = "dns")]
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(any(feature = "kdc", feature = "dns"))]
 fn advertised_host(config: &config::Config) -> String {
     if let Some(host) = config.cldap.dns_host.clone() {
         return host;
@@ -656,6 +693,49 @@ async fn serve() {
         None
     };
 
+    // The zone this server answers for, derived from what it already knows - the naming context
+    // names it, the advertised host is the record every `SRV` targets - and written before the
+    // directory is built, so the first query finds it rather than a zone that appears a second
+    // later.
+    #[cfg(feature = "dns")]
+    let dns_settings = if config.dns.enabled {
+        // The LDAP listener is not bound yet at this point, so the address comes from the
+        // configuration that will bind it: a zone written after the bind would be a zone missing for
+        // the first queries, and those are the ones a client asks.
+        let address = config
+            .listen_addr
+            .parse::<std::net::SocketAddr>()
+            .map(|addr| addr.ip())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let settings = match rrl_directory::dns::config::Settings::resolve(
+            &config.dns,
+            &config.base_dn,
+            address,
+        ) {
+            Ok(settings) => settings,
+            Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+        };
+        let facts = rrl_directory::dns::provision::Facts {
+            base_dn: config.base_dn.clone(),
+            dns_domain: settings.dns_domain.clone(),
+            dns_host: advertised_host(&config),
+            address: settings.address,
+            // `YYYYMMDDnn`, the serial AD and every zone file use: an operator reading it knows the
+            // day the zone was created, and a secondary compares numbers rather than dates.
+            serial: zone_serial(),
+        };
+        match rrl_directory::dns::provision::ensure(&backend, &facts).await {
+            Ok(created) if !created.is_empty() => {
+                eprintln!("provision: created the zone's {} entry/entries", created.len())
+            }
+            Ok(_) => {}
+            Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+        }
+        Some(settings)
+    } else {
+        None
+    };
+
     let (source, directory) = match rrl_directory::reload::Source::load(&config, backend).await {
         Ok(loaded) => loaded,
         Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
@@ -939,6 +1019,43 @@ async fn serve() {
         }
     } else {
         None
+    };
+
+    // The zone, when asked for: the same name a client already found us by, answered from this
+    // directory. Started before the KDC because a client asks DNS before it asks for a ticket, and a
+    // failure here is an error rather than a listener that answers `SERVFAIL` to everything - which
+    // is indistinguishable from a network fault at the other end.
+    #[cfg(feature = "dns")]
+    let _dns_task = match dns_settings {
+        Some(settings) => match rrl_directory::dns::serve::listen_from_directory(
+            settings.bind,
+            Arc::clone(&source),
+            &config.base_dn,
+            &settings.dns_domain,
+            settings.clone(),
+        )
+        .await
+        {
+            Ok(running) => {
+                println!(
+                    "dns: serving {} on {} (udp and tcp){}",
+                    settings.dns_domain,
+                    running.bind,
+                    match settings.forwarder_for(&settings.dns_domain) {
+                        // The zone's own name is never forwarded, so this branch reports the
+                        // *default* list when there is one and silence otherwise.
+                        _ if !settings.forward_default.is_empty() =>
+                            format!(", forwarding elsewhere to {}", settings.forward_default.len()),
+                        _ if !settings.forward_zones.is_empty() =>
+                            format!(", {} forwarded suffix(es)", settings.forward_zones.len()),
+                        _ => ", refusing other names".to_string(),
+                    }
+                );
+                Some(running)
+            }
+            Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
+        },
+        None => None,
     };
 
     // The KDC, when asked for. It reads the realm out of the same directory this process serves, so

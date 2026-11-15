@@ -397,6 +397,7 @@ pub async fn listen_from_directory(
     source: Arc<crate::reload::Source>,
     base_dn: &str,
     dns_name: &str,
+    forward: crate::dns::config::Settings,
 ) -> Result<Running, String> {
     let in_directory = InDirectory::new(Arc::clone(&source), base_dn, dns_name);
     match in_directory.read().await {
@@ -413,7 +414,179 @@ pub async fn listen_from_directory(
     }
     let handler = FromSource::new(Arc::new(in_directory), dns_name)
         .ok_or_else(|| format!("dns zone '{dns_name}' is not a DNS name"))?;
-    listen(bind, catalog_from(Arc::new(handler))).await
+    let handler = Arc::new(handler);
+    let ours = handler.origin().clone();
+    let catalog = catalog_from(Arc::clone(&handler));
+    // The forwarder is told the bind address, because the settings come from the configuration and
+    // the port may have been chosen by the kernel: a listener that reported a different address than
+    // it took would be one nobody can find.
+    let forward = crate::dns::config::Settings {
+        bind,
+        ..forward
+    };
+    listen(bind, Answering::new(catalog, ours, forward)).await
+}
+
+/// A catalog plus a forwarder: the zone this server holds, and everywhere else it was told to ask.
+///
+/// The split is by name, and the boundary is the whole reason this type exists rather than a second
+/// zone handler: a name inside our zone is answered from the directory and **never** leaves, which is
+/// what keeps a local record from being overridden by an upstream that has a different idea about the
+/// same name. Anything else goes to the configured servers, or is refused.
+pub struct Answering {
+    catalog: Catalog,
+    /// The origin below which every name is ours.
+    ours: LowerName,
+    /// The servers for everything else, empty when nothing is forwarded.
+    forward: crate::dns::config::Settings,
+}
+
+impl Answering {
+    /// A handler over `catalog` (which answers `ours`) and `forward` for the rest.
+    pub fn new(catalog: Catalog, ours: LowerName, forward: crate::dns::config::Settings) -> Self {
+        Self {
+            catalog,
+            ours,
+            forward,
+        }
+    }
+
+    /// Whether `name` is this server's to answer.
+    fn is_ours(&self, name: &LowerName) -> bool {
+        // `zone_of` walks the labels up, so a name below the origin is ours and the origin itself is
+        // ours: `Catalog::find` does the same walk, and a second rule would put a name on one side of
+        // the boundary here and the other side there.
+        let mut candidate = name.clone();
+        loop {
+            if candidate == self.ours {
+                return true;
+            }
+            if candidate.is_root() {
+                return false;
+            }
+            candidate = candidate.base_name();
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl hickory_server::server::RequestHandler for Answering {
+    async fn handle_request<R: hickory_server::server::ResponseHandler, T: hickory_server::net::runtime::Time>(
+        &self,
+        request: &Request,
+        response_handle: R,
+    ) -> hickory_server::server::ResponseInfo {
+        let Some(query) = request.queries.queries().first() else {
+            return self.catalog.handle_request::<R, T>(request, response_handle).await;
+        };
+        if self.is_ours(query.name()) {
+            return self.catalog.handle_request::<R, T>(request, response_handle).await;
+        }
+        if !crate::dns::forward::is_forwardable(query.query_type()) {
+            return answer_with(
+                request,
+                response_handle,
+                ResponseCode::Refused,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        }
+
+        let Some(servers) = self
+            .forward
+            .forwarder_for(&query.name().to_ascii())
+            .map(<[std::net::SocketAddr]>::to_vec)
+        else {
+            // Nothing configured for this name: the honest answer is `REFUSED`, which tells a client
+            // to ask its own resolver. `NXDOMAIN` would cache an absence nobody established.
+            return answer_with(
+                request,
+                response_handle,
+                ResponseCode::Refused,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        };
+
+        match crate::dns::forward::ask(query.original(), &servers).await {
+            Some(answer) => {
+                tracing::debug!(
+                    name = %query.name(),
+                    rtype = ?query.query_type(),
+                    servers = servers.len(),
+                    answers = answer.answers.len(),
+                    "dns: forwarded"
+                );
+                let code = answer.metadata.response_code;
+                let answers: Vec<Record> = answer.answers;
+                let authorities: Vec<Record> = answer.authorities;
+                answer_with(request, response_handle, code, answers, authorities).await
+            }
+            None => {
+                // Configured and did not work: `SERVFAIL` is the code for exactly that.
+                tracing::warn!(
+                    name = %query.name(),
+                    servers = servers.len(),
+                    "dns: no upstream answered"
+                );
+                answer_with(
+                    request,
+                    response_handle,
+                    ResponseCode::ServFail,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// Writes one answer, with the records as they are.
+async fn answer_with<R: hickory_server::server::ResponseHandler>(
+    request: &Request,
+    mut response_handle: R,
+    code: ResponseCode,
+    answers: Vec<Record>,
+    authorities: Vec<Record>,
+) -> hickory_server::server::ResponseInfo {
+    use hickory_server::zone_handler::MessageResponseBuilder;
+
+    let mut metadata = hickory_server::proto::op::Metadata::response_from_request(
+        &request.metadata,
+    );
+    metadata.response_code = code;
+    metadata.authoritative = false;
+    // The recursion flag describes this server's own behaviour: it forwarded, so it was available.
+    metadata.recursion_available = !answers.is_empty() || code == ResponseCode::NXDomain;
+
+    let response = MessageResponseBuilder::new(&request.queries, request.edns.as_ref()).build(
+        metadata,
+        answers.iter(),
+        authorities.iter(),
+        std::iter::empty(),
+        std::iter::empty(),
+    );
+    match response_handle.send_response(response).await {
+        Ok(info) => info,
+        Err(err) => {
+            // The write failed, which for a forwarder's answer is the client's problem and not
+            // this server's: a UDP client that never sees an answer asks again, and a TCP one gets
+            // a closed connection. Reported, and described as the `SERVFAIL` it would have been -
+            // there is no `ResponseInfo` for "nothing was sent", and claiming the records went out
+            // would put a count in the metrics that never reached a wire.
+            tracing::warn!(%err, "dns: the answer could not be written");
+            // `Metadata` is `#[non_exhaustive]`, so it is adjusted rather than rebuilt.
+            let mut failed = metadata;
+            failed.response_code = ResponseCode::ServFail;
+            hickory_server::server::ResponseInfo::from(hickory_server::proto::op::Header {
+                metadata: failed,
+                counts: hickory_server::proto::op::HeaderCounts::default(),
+            })
+        }
+    }
 }
 
 /// What a started listener is: where it took the port and the task serving it.
@@ -438,7 +611,10 @@ impl Running {
 ///
 /// A failure to bind either transport is an error here, not a listener that silently answers half the
 /// questions: a zone reachable over UDP and not TCP is one whose large answers are truncated forever.
-pub async fn listen(bind: SocketAddr, catalog: Catalog) -> Result<Running, String> {
+pub async fn listen<H>(bind: SocketAddr, handler: H) -> Result<Running, String>
+where
+    H: hickory_server::server::RequestHandler,
+{
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|err| format!("dns {bind} tcp: {err}"))?;
@@ -449,7 +625,7 @@ pub async fn listen(bind: SocketAddr, catalog: Catalog) -> Result<Running, Strin
         .await
         .map_err(|err| format!("dns {addr} udp: {err}"))?;
 
-    let mut server = Server::new(catalog);
+    let mut server = Server::new(handler);
     server.register_socket(socket);
     server.register_listener(listener, TCP_TIMEOUT, TCP_BUFFER);
 

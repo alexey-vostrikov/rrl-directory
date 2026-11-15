@@ -1745,6 +1745,8 @@ mod tests {
             smb: Default::default(),
             cache: crate::record_cache::CacheConfig::default(),
             cldap: Default::default(),
+            #[cfg(feature = "dns")]
+            dns: Default::default(),
             backend: "file".to_string(),
             base_dn: "dc=example,dc=com".to_string(),
             listen_addr: "127.0.0.1:0".to_string(),

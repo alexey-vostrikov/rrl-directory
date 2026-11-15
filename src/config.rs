@@ -310,6 +310,13 @@ pub struct Config {
     pub limits: crate::limits::Limits,
     /// How many materialised records to keep, when the snapshot holds skeletons.
     pub cache: crate::record_cache::CacheConfig,
+    /// Whether to serve the domain's own zone on port 53, and where the rest goes.
+    ///
+    /// Off unless an operator turns it on, for the reason `cldap` is off: answering on 53 says "this
+    /// address resolves the domain", and a server that says so and answers nothing is worse than one
+    /// that never claimed it.
+    #[cfg(feature = "dns")]
+    pub dns: crate::dns::config::DnsConfig,
     /// Whether to answer CLDAP pings on UDP 389, and what to advertise.
     ///
     /// Off unless an operator turns it on: a reply to a ping says "this address is a domain
@@ -493,6 +500,10 @@ struct FileConfig {
     /// How many records to keep materialised, under the memory ceiling.
     #[serde(default)]
     cache: crate::record_cache::CacheConfig,
+    /// The domain's own zone on port 53, off unless asked for.
+    #[cfg(feature = "dns")]
+    #[serde(default)]
+    dns: crate::dns::config::DnsConfig,
     /// CLDAP ping, off unless asked for.
     #[serde(default)]
     cldap: crate::cldap::CldapConfig,
@@ -877,6 +888,8 @@ pub fn resolve(
         integrity: file.integrity,
         limits: crate::limits::Limits::from_config(&file.limits),
         cache: file.cache,
+        #[cfg(feature = "dns")]
+        dns: file.dns.clone(),
         cldap: file.cldap,
         emulation: file.emulation,
         #[cfg(feature = "kdc")]

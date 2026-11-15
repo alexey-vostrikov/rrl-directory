@@ -117,6 +117,25 @@ fn journal_note(
 }
 
 /// The metric label for a protocol operation.
+/// The opening octets of a message, as hex, for a failure that has to name what arrived.
+///
+/// Long enough to see an LDAP envelope and its message id, its protocol op and the first field of
+/// the op - which is what tells a SASL token from a search from a frame that was never a message.
+fn hex_head(bytes: &[u8]) -> String {
+    const SHOWN: usize = 48;
+    let mut out = String::with_capacity(SHOWN * 3);
+    for (index, byte) in bytes.iter().take(SHOWN).enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!("{byte:02x}"));
+    }
+    if bytes.len() > SHOWN {
+        out.push_str(&format!(" … ({} octets)", bytes.len()));
+    }
+    out
+}
+
 fn operation_of(operation: &rasn_ldap::ProtocolOp) -> Option<Operation> {
     use rasn_ldap::ProtocolOp;
 
@@ -206,7 +225,7 @@ pub async fn serve_connection_as(
         // operation already being answered is finished before the connection is
         // closed, which is what "graceful" has to mean for a client mid-search.
         let bytes = match tokio::select! {
-            read = codec::read_message_with(&mut stream, session.wrap()) => read,
+            read = codec::read_from(&mut stream, &mut session) => read,
             // A change to push down one of the persistent searches. `Lagged` means this connection
             // fell behind the buffer: the honest recovery is to let it re-read, which the client
             // does when its cookie no longer matches, so the subscription is dropped rather than
@@ -220,7 +239,7 @@ pub async fn serve_connection_as(
                             for message in
                                 subscription.messages_for(&notice, &directory, &policy)
                             {
-                                if codec::write_message_with(&mut stream, &message, session.wrap()).await.is_err() {
+                                if codec::write_to(&mut stream, &message, &mut session).await.is_err() {
                                     return Ok(Hangup::PeerClosed);
                                 }
                             }
@@ -262,9 +281,26 @@ pub async fn serve_connection_as(
 
         let message = match codec::decode(&bytes) {
             Ok(message) => message,
-            // A message that cannot be decoded is a protocol error, not a reason to
-            // keep reading: the frame boundary is no longer trustworthy.
-            Err(_) => return Ok(Hangup::Malformed),
+            // A message that cannot be decoded is a protocol error, not a reason to keep reading:
+            // the frame boundary is no longer trustworthy. The reason and the opening octets are
+            // printed here, because the other end can only say "the specified network resource is
+            // no longer available" (0x37) - a code that names neither the message nor the field. A
+            // `DomainGuid` check that answers "malformed, connection closed" leaves an afternoon
+            // of guessing; the octets answer it in one line.
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    crate::i18n::t(
+                        "error.malformed",
+                        &[
+                            ("peer", &peer.to_string()),
+                            ("detail", &err.to_string()),
+                            ("head", &hex_head(&bytes)),
+                        ]
+                    )
+                );
+                return Ok(Hangup::Malformed);
+            }
         };
 
         // One snapshot per message: a reload or another client's write is visible
@@ -275,6 +311,19 @@ pub async fn serve_connection_as(
 
         let operation = operation_of(&message.protocol_op);
         let started = std::time::Instant::now();
+
+        // One line per request, at `debug`: on a stand the question is nearly always "what did the
+        // client do next", and a client that stops sending cannot say. `wrapped` says whether the
+        // session has a security layer, which is the difference between "it went quiet" and "it is
+        // sealing what we cannot read".
+        tracing::debug!(
+            peer = %peer,
+            id = message.message_id,
+            op = ?operation,
+            octets = bytes.len(),
+            wrapped = session.wrap().is_some(),
+            "ldap: request"
+        );
 
         // One call, and then the snapshot is let go at once. Nothing below reads it, and a write
         // among these actions is about to replace exactly this snapshot: holding it here is what
@@ -307,7 +356,7 @@ pub async fn serve_connection_as(
                 }
 
                 for message in messages {
-                    codec::write_message_with(&mut stream, &message, session.wrap()).await?;
+                    codec::write_to(&mut stream, &message, &mut session).await?;
                 }
             }
             Action::Persist(action) => {
@@ -340,7 +389,7 @@ pub async fn serve_connection_as(
 
                 match outcome {
                     Ok(_) => {
-                        codec::write_message_with(&mut stream, &success, session.wrap()).await?
+                        codec::write_to(&mut stream, &success, &mut session).await?
                     }
                     Err(err) => {
                         eprintln!(
@@ -352,7 +401,7 @@ pub async fn serve_connection_as(
                             rasn_ldap::ResultCode::UnwillingToPerform,
                             &format!("error updating backend data: {err}"),
                         );
-                        codec::write_message_with(&mut stream, &response, session.wrap()).await?;
+                        codec::write_to(&mut stream, &response, &mut session).await?;
                     }
                 }
             }
@@ -361,7 +410,7 @@ pub async fn serve_connection_as(
                 subscription,
             } => {
                 for message in &messages {
-                    codec::write_message_with(&mut stream, message, session.wrap()).await?;
+                    codec::write_to(&mut stream, message, &mut session).await?;
                 }
                 // Registered before the loop continues, so a change that lands while the answer is
                 // still being written is delivered rather than lost between the refresh and the
@@ -370,7 +419,7 @@ pub async fn serve_connection_as(
             }
             Action::PersistAfterReply { messages, changes } => {
                 for message in &messages {
-                    codec::write_message_with(&mut stream, message, session.wrap()).await?;
+                    codec::write_to(&mut stream, message, &mut session).await?;
                 }
                 // The reply is already out and it is correct; a failure here is an
                 // operational problem to log, not an error to report to this client.
@@ -398,12 +447,12 @@ pub async fn serve_connection_as(
                     &adopted,
                 );
                 let _ = (generation, response);
-                codec::write_message_with(&mut stream, &answer, session.wrap()).await?;
+                codec::write_to(&mut stream, &answer, &mut session).await?;
             }
             Action::Silent => {}
             Action::StartTls(message_id) => {
                 if acceptor.is_none() {
-                    codec::write_message_with(
+                    codec::write_to(
                         &mut stream,
                         &crate::ldap::responses::extended_response(
                             message_id,
@@ -411,13 +460,13 @@ pub async fn serve_connection_as(
                             "StartTLS is not configured on this server",
                             None,
                         ),
-                        session.wrap(),
+                        &mut session,
                     )
                     .await?;
                     continue;
                 }
 
-                codec::write_message_with(
+                codec::write_to(
                     &mut stream,
                     &crate::ldap::responses::extended_response(
                         message_id,
@@ -425,7 +474,7 @@ pub async fn serve_connection_as(
                         "",
                         Some(crate::ldap::starttls::STARTTLS_OID),
                     ),
-                    session.wrap(),
+                    &mut session,
                 )
                 .await?;
 
@@ -807,11 +856,11 @@ pub async fn serve_with(
                         Ok(Hangup::PeerClosed) | Ok(Hangup::Unbind) | Ok(Hangup::Shutdown) => {
                             tracing::debug!(peer = %peer, how = ?outcome.as_ref().ok(), "ldap: connection closed");
                         }
+                        // The reason was printed where the message was decoded, with its octets:
+                        // printing "malformed, connection closed" twice says nothing the first
+                        // line had not already said better.
                         Ok(Hangup::Malformed) => {
-                            eprintln!(
-                                "{}",
-                                crate::i18n::t("error.malformed", &[("peer", &peer.to_string())])
-                            );
+                            tracing::debug!(peer = %peer, "ldap: the connection ended on a malformed message");
                         }
                         Ok(Hangup::TlsHandshakeFailed) => {
                             eprintln!(
@@ -916,6 +965,8 @@ mod tests {
             #[cfg(feature = "smb")]
             smb: Default::default(),
             cldap: Default::default(),
+            #[cfg(feature = "dns")]
+            dns: Default::default(),
             cache: crate::record_cache::CacheConfig::default(),
             backend: "file".to_string(),
             base_dn: BASE.to_string(),

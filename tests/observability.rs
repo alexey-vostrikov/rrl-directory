@@ -58,6 +58,7 @@ fn admin() -> Session {
 fn security() -> Security {
     Security {
         allow_unencrypted_bind: true,
+        allow_ntlm: false,
         ..Security::default()
     }
 }

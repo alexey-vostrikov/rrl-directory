@@ -323,7 +323,34 @@ pub(crate) fn step(
                 .record(&dn)
                 .map(|record| record.into_owned())
                 .ok_or_else(|| SaslError::Ticket(format!("'{dn}' could not be read back")))?;
-            let identity = crate::ldap::session::Identity::new(&dn, entry.is_admin());
+            // The memberships this account has *here*, because NTLM has no PAC to carry any: a
+            // ticket states a client's groups and a password hash does not. `memberOf` is where an
+            // AD account's groups are written, so it is what the session holds until it ends - the
+            // same lifespan a PAC's groups have, and the same question an access rule asks.
+            //
+            // `is_member` still answers for a group whose own entry names this account; this adds
+            // the other direction, which is how AD writes membership and how a Windows client
+            // expects `group=` rules to see it.
+            let groups: Vec<String> = entry
+                .attributes()
+                .get("memberOf")
+                .map(|attribute| {
+                    attribute
+                        .values
+                        .iter()
+                        .map(|value| crate::dn::normalize(value))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !groups.is_empty() {
+                tracing::debug!(
+                    dn = %dn,
+                    groups = groups.len(),
+                    "ntlm: the session holds the account's groups"
+                );
+            }
+            let identity =
+                crate::ldap::session::Identity::new(&dn, entry.is_admin()).with_groups(groups);
 
             tracing::info!(dn = %dn, "ntlm: logon accepted");
             session.set_ntlm_challenge(None);
@@ -435,6 +462,13 @@ mod tests {
             .push(Attribute::single("cn", ACCOUNT))
             .push(Attribute::single("objectClass", "user"))
             .push(Attribute::single("userAccountControl", "512"))
+            // A group the account belongs to, the way AD writes membership: on the member, and with
+            // no `member` back on the group. NTLM has no PAC to carry this, so the session has to
+            // read it from here.
+            .push(Attribute::single(
+                "memberOf",
+                "cn=Domain Admins,ou=groups,dc=example,dc=com",
+            ))
             .push(Attribute::single(
                 rrl_kdc::hdb::ldap::attrs::AD_SUPPLEMENTAL_CREDENTIALS,
                 &base64::engine::general_purpose::STANDARD
@@ -586,23 +620,52 @@ mod tests {
             "the identity is the entry, not the name the client typed"
         );
         assert!(session.ntlm_challenge().is_none(), "the challenge is spent");
+        assert_eq!(
+            identity.groups,
+            vec!["cn=domain admins,ou=groups,dc=example,dc=com".to_string()],
+            "the groups the account has here travel with the session: NTLM carries no PAC, so \
+             `memberOf` is the only place they can come from"
+        );
     }
 
-    /// A wrong password is a refusal, and it is the same refusal an absent account gets.
+    /// A wrong password and an account that does not exist are two different answers.
+    ///
+    /// The work is the same either way - an unknown account is checked against a fixed zero hash -
+    /// so the difference is in the sentence and not in the clock. That is the point: an operator
+    /// reading `invalidCredentials` over and over needs to know which of the two it is, and an
+    /// attacker timing the bind must not learn the same thing.
     #[test]
-    fn a_wrong_password_does_not_verify() {
+    fn a_wrong_password_and_an_absent_account_read_differently() {
         let directory = directory();
-        let mut session = Session::new();
-        let round = step(&mut session, &directory, &negotiate(), &security()).expect("a challenge");
-        let challenge = challenge_of(&round.credentials.expect("a challenge message"));
 
-        let result = step(
-            &mut session,
-            &directory,
-            &authenticate(&challenge, "not the password", ACCOUNT),
-            &security(),
+        let attempt = |account: &str, password: &str| {
+            let mut session = Session::new();
+            let round =
+                step(&mut session, &directory, &negotiate(), &security()).expect("a challenge");
+            let challenge = challenge_of(&round.credentials.expect("a challenge message"));
+            match step(
+                &mut session,
+                &directory,
+                &authenticate(&challenge, password, account),
+                &security(),
+            ) {
+                Ok(_) => panic!("neither attempt may verify: {account}"),
+                Err(err) => err.to_string(),
+            }
+        };
+
+        let wrong_password = attempt(ACCOUNT, "not the password");
+        let absent = attempt("nobody", "not the password");
+
+        assert!(
+            wrong_password.contains("password is wrong"),
+            "the account exists and the password is wrong: {wrong_password}"
         );
-        assert!(result.is_err(), "a wrong password must not verify");
+        assert!(
+            absent.contains("no such account"),
+            "nothing is called that: {absent}"
+        );
+        assert_ne!(wrong_password, absent, "two facts, two answers");
     }
 
     /// An answer with no challenge outstanding is refused rather than checked against zeroes - a

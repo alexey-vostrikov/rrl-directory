@@ -543,6 +543,7 @@ mod tests {
     fn security() -> Security {
         Security {
             allow_unencrypted_bind: true,
+            allow_ntlm: false,
             ..Security::default()
         }
     }

@@ -116,6 +116,7 @@ fn security(policy: PasswordPolicy) -> Security {
         // These tests bind over a plain duplex stream: the transport rule is not what
         // they are about, and it has its own tests.
         allow_unencrypted_bind: true,
+        allow_ntlm: false,
         ..Security::default()
     }
 }
@@ -494,6 +495,7 @@ async fn the_upgrade_does_not_widen_what_may_be_verified() {
     let strict = Security {
         passwords: PasswordPolicy::strict(),
         allow_unencrypted_bind: true,
+        allow_ntlm: false,
         ..Security::default()
     };
 

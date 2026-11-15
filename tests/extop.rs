@@ -75,6 +75,7 @@ fn directory() -> Directory {
 fn security() -> Security {
     Security {
         allow_unencrypted_bind: true,
+        allow_ntlm: false,
         ..Security::default()
     }
 }
@@ -308,6 +309,7 @@ fn an_empty_request_gets_a_generated_password() {
 fn a_password_change_needs_an_acceptable_transport() {
     let strict = Security {
         allow_unencrypted_bind: false,
+        allow_ntlm: false,
         ..Security::default()
     };
     let value = request_value(None, Some(SECRET), Some("new"));

@@ -385,6 +385,28 @@ pub const MECHANISMS: [&str; 2] = ["GSSAPI", "GSS-SPNEGO"];
 /// another.
 const SPNEGO_MECHANISM: &str = "GSS-SPNEGO";
 
+/// The token of a bind that names an NTLM mechanism outright, if this is one.
+///
+/// `None` for every other mechanism, including `GSS-SPNEGO`: that one carries NTLM inside an
+/// envelope and is read by the SASL path above, which has to answer in the envelope it came in.
+#[cfg(feature = "smb")]
+pub fn ntlm_token(request: &BindRequest) -> Option<&[u8]> {
+    let AuthenticationChoice::Sasl(credentials) = &request.authentication else {
+        return None;
+    };
+    let mechanism = credentials.mechanism.0.as_str();
+    let named = ["NTLMSSP", "GSS-NTLMSSP"]
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(mechanism));
+    named.then(|| {
+        credentials
+            .credentials
+            .as_ref()
+            .map(|value| value.as_ref())
+            .unwrap_or_default()
+    })
+}
+
 /// Whether the client asked for NTLMSSP, as opposed to merely being able to.
 ///
 /// `GSS-SPNEGO` is a container, and which mechanism is inside decides who can answer.
@@ -493,14 +515,11 @@ pub fn handle_gssapi(
         );
     }
 
-    let Some(gssapi) = security.gssapi.clone() else {
-        session.reset();
-        return bind_response(
-            message_id,
-            ResultCode::AuthMethodNotSupported,
-            "SASL is not configured on this server: no keytab, so no ticket can be accepted",
-        );
-    };
+    // Read here, but *required* only by the paths that need a ticket: NTLM is proved with a password
+    // hash and needs no keytab, so a deployment that offers nothing but NTLM is a deployment this
+    // server can serve. Whether it does at all is `sasl.allow_ntlm`, checked below once the
+    // mechanism is known.
+    let gssapi = security.gssapi.clone();
 
     if request.version != 3 {
         session.reset();
@@ -565,6 +584,20 @@ pub fn handle_gssapi(
     #[cfg(not(feature = "smb"))]
     let ntlm = false;
 
+    // The operator's decision, before any of the work: a server that has not been told to accept
+    // NTLMSSP answers as a server that does not implement it, which is the honest answer and the one
+    // a client reports as `authMethodNotSupported` rather than as a wrong password.
+    #[cfg(feature = "smb")]
+    if (ntlm || ntlm_layer) && !security.allow_ntlm {
+        session.reset();
+        return bind_response(
+            message_id,
+            ResultCode::AuthMethodNotSupported,
+            "NTLMSSP is not enabled on this server: it proves a client with a password hash and no \
+             ticket, so it is off unless the configuration turns it on (sasl.allow_ntlm: true)",
+        );
+    }
+
     let outcome = if ntlm_layer {
         #[cfg(feature = "smb")]
         {
@@ -582,6 +615,15 @@ pub fn handle_gssapi(
         #[cfg(not(feature = "smb"))]
         unreachable!("`ntlm` is a constant false without the smb feature")
     } else {
+        // Every remaining path needs a ticket, and a ticket needs an acceptor.
+        let Some(gssapi) = gssapi else {
+            session.reset();
+            return bind_response(
+                message_id,
+                ResultCode::AuthMethodNotSupported,
+                "SASL is not configured on this server: no keytab, so no ticket can be accepted",
+            );
+        };
         match session.sasl_stage() {
             Some(Stage::OfferSent) => offer_layer(session, token),
             Some(Stage::ChoiceExpected) => accept_choice(session, token),
@@ -608,6 +650,47 @@ pub fn handle_gssapi(
         }
     };
 
+    finish(session, message_id, outcome)
+}
+
+/// A SASL bind that names NTLMSSP outright, rather than wrapping it in SPNEGO.
+///
+/// Samba's `GSS-NTLMSSP` and the bare `NTLMSSP` are both this: the mechanism a member falls back to
+/// when it has a password and no ticket. The rounds are the acceptor's own - the same three the
+/// `GSS-SPNEGO` envelope carries - and only the framing of the answer differs, so the work is
+/// [`super::ntlm_bind::step`] and the rest is the tail every SASL round ends with.
+#[cfg(feature = "smb")]
+pub fn handle_ntlm(
+    session: &mut Session,
+    directory: &Directory,
+    message_id: MessageId,
+    token: &[u8],
+    security: &Security,
+) -> rasn_ldap::LdapMessage {
+    if !security.allow_ntlm {
+        session.reset();
+        return bind_response(
+            message_id,
+            ResultCode::AuthMethodNotSupported,
+            "NTLMSSP is not enabled on this server: it proves a client with a password hash and no \
+             ticket, so it is off unless the configuration turns it on (sasl.allow_ntlm: true)",
+        );
+    }
+
+    if starts_fresh(session) {
+        session.reset();
+    }
+
+    let outcome = super::ntlm_bind::step(session, directory, token, security);
+    finish(session, message_id, outcome)
+}
+
+/// The end every SASL round has: the identity on the session, the layer pending, the answer built.
+fn finish(
+    session: &mut Session,
+    message_id: MessageId,
+    outcome: Result<Round, SaslError>,
+) -> rasn_ldap::LdapMessage {
     match outcome {
         Ok(Round {
             code,
@@ -1416,6 +1499,10 @@ mod tests {
 
         let gssapi = crate::sasl::Gssapi::load(
             &crate::sasl::SaslConfig {
+                // On: the NTLM-inside-SPNEGO round below is what half of this file is about, and a
+                // fixture that left the gate shut would be testing the refusal instead. The gate
+                // has its own test, in `bind`.
+                allow_ntlm: true,
                 pac: crate::pac_policy::PacConfig::default(),
                 keytab: Some(path),
                 service_principal: None,
@@ -1430,7 +1517,11 @@ mod tests {
         .expect("some sasl");
 
         (
-            Security::default().with_gssapi(Some(std::sync::Arc::new(gssapi))),
+            Security {
+                allow_ntlm: true,
+                ..Security::default()
+            }
+            .with_gssapi(Some(std::sync::Arc::new(gssapi))),
             dir,
         )
     }

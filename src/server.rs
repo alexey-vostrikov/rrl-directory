@@ -1017,6 +1017,7 @@ mod tests {
     fn default_security() -> Security {
         Security {
             allow_unencrypted_bind: true,
+            allow_ntlm: false,
             ..Security::default()
         }
     }
@@ -1323,6 +1324,7 @@ mod tests {
     async fn plaintext_bind_is_refused_when_encryption_is_required() {
         let security = Security {
             allow_unencrypted_bind: false,
+            allow_ntlm: false,
             ..Security::default()
         };
         let mut running = start(None, false, security).await;
@@ -1409,6 +1411,7 @@ mod tests {
         let (acceptor, anchor) = test_acceptor();
         let security = Security {
             allow_unencrypted_bind: false,
+            allow_ntlm: false,
             ..Security::default()
         };
         let mut running = start(Some(acceptor), false, security).await;

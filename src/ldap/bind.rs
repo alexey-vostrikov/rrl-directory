@@ -82,6 +82,14 @@ fn authenticate(
         return super::sasl_bind::handle_gssapi(session, directory, message_id, request, security);
     }
 
+    // A bind that names NTLMSSP outright - Samba's `GSS-NTLMSSP` or the bare spelling. Before the
+    // refusal below, because "not offered" is now a decision rather than a fact: it is offered when
+    // the configuration says so, and the acceptor's own answer is the one that knows.
+    #[cfg(feature = "smb")]
+    if let Some(token) = super::sasl_bind::ntlm_token(request) {
+        return super::sasl_bind::handle_ntlm(session, directory, message_id, token, security);
+    }
+
     // The Sicily bind, before the version check because it is a *version 2* bind: Microsoft's LDAP
     // client sends the name `NTLM` and an NTLMSSP message where a password would go, and it does so
     // before the machine has any ticket. Measured on the AD-join stand: an `Add-Computer` from a
@@ -125,12 +133,15 @@ fn authenticate(
             // implementation beside the one in the SMB session and the one in this directory's own
             // simple bind, and two checks of one password are two chances to disagree. A Samba
             // member reaches Kerberos with `-k` or with a ticket in `KRB5CCNAME`.
+            // NTLM is named apart from the rest: reaching this arm means this build has no
+            // acceptor for it at all, and the sentence says how to get there rather than leaving a
+            // client to guess.
             let message = if is_ntlm(&mechanism) {
                 format!(
-                    "SASL mechanism {mechanism} is not offered: this server accepts Kerberos \
-                     ({}), not NTLM. A Samba member joins with `net ads join -k` and a ticket \
-                     from `kinit`; a password makes it choose NTLM, which this directory does not \
-                     check.",
+                    "SASL mechanism {mechanism} is not offered by this build: this server accepts \
+                     Kerberos ({}), and NTLM only where the acceptor is compiled in and \
+                     `sasl.allow_ntlm` is set. A Samba member joins with `net ads join -k` and a \
+                     ticket from `kinit`.",
                     crate::ldap::sasl_bind::MECHANISMS.join(", ")
                 )
             } else {
@@ -312,6 +323,7 @@ mod tests {
     fn security() -> Security {
         Security {
             allow_unencrypted_bind: true,
+            allow_ntlm: false,
             ..Security::default()
         }
     }
@@ -521,12 +533,31 @@ mod tests {
         );
     }
 
+    /// `sasl.allow_ntlm`: NTLM is answered only once the configuration says so, and the refusal
+    /// names the setting.
+    ///
+    /// The default is off because NTLM proves a client with a password hash and nothing else - no
+    /// ticket, no channel binding - and a server that answers it without being asked accepts a
+    /// weaker proof than it advertises. A joining Windows machine always takes this path, and a
+    /// member falls back to it whenever the KDC is unreachable, so which answer it gets is the
+    /// operator's decision and has to be a visible one.
+    /// A NEGOTIATE_MESSAGE, forty octets as MS-NLMP 2.2.1.1 lays it out.
+    ///
+    /// Only what the acceptor reads: the signature, the type, empty name fields, the flags. The
+    /// challenge it produces from this is not what this file checks - that the mechanism is
+    /// reachable is - so the fixture is the smallest message the parser accepts.
+    fn negotiate() -> Vec<u8> {
+        let mut message = Vec::new();
+        message.extend_from_slice(b"NTLMSSP\0");
+        message.extend_from_slice(&1u32.to_le_bytes());
+        message.extend_from_slice(&[0u8; 16]);
+        message.extend_from_slice(&0x0008_8207u32.to_le_bytes());
+        message.extend_from_slice(&[0u8; 8]);
+        message
+    }
+
     #[test]
-    fn a_sasl_mechanism_that_is_ntlm_is_refused_differently_from_an_unknown_one() {
-        // Two different facts for the operator: "never heard of it" and "deliberately not offered".
-        // Samba spells the wrapped one `GSS-NTLMSSP` and the bare one `NTLMSSP`, and a client that
-        // takes the password path sends one of these - the refusal has to lead to `-k`, not to a
-        // mechanism list.
+    fn ntlm_is_off_until_the_configuration_turns_it_on() {
         let directory = directory();
 
         for name in ["GSS-NTLMSSP", "NTLMSSP", "ntlmssp"] {
@@ -546,14 +577,40 @@ mod tests {
             assert_eq!(
                 code(&response),
                 ResultCode::AuthMethodNotSupported,
-                "{name}"
+                "{name}: a mechanism the server was not told to answer"
             );
-            assert!(message.contains(name), "{name}: {message}");
             assert!(
-                message.contains("-k"),
-                "{name}: the answer says how to reach Kerberos: {message}"
+                message.contains("sasl.allow_ntlm"),
+                "{name}: the refusal says which setting decides it: {message}"
             );
         }
+
+        // And with the gate open the same bind reaches the acceptor, which answers the first round
+        // with a challenge - not with a refusal. That the challenge is the right one is
+        // `ntlm_bind`'s question; that the mechanism is reachable at all is this one.
+        let mut session = Session::new();
+        let sasl = BindRequest::new(
+            3,
+            rasn_ldap::LdapDn::from(ADMIN_DN),
+            AuthenticationChoice::Sasl(rasn_ldap::SaslCredentials::new(
+                rasn_ldap::LdapString::from("NTLMSSP"),
+                Some(rasn::types::OctetString::from(negotiate())),
+            )),
+        );
+        let allowed = Security {
+            allow_ntlm: true,
+            ..security()
+        };
+        let response = handle_bind(&mut session, &directory, 11, &sasl, &allowed);
+        let rasn_ldap::ProtocolOp::BindResponse(body) = &response.protocol_op else {
+            panic!("expected a bind response");
+        };
+        assert_ne!(
+            body.result_code,
+            ResultCode::AuthMethodNotSupported,
+            "allowed means answered: {:?}",
+            body.diagnostic_message
+        );
     }
 
     #[test]
@@ -699,6 +756,7 @@ mod tests {
         let mut session = Session::new();
         let security = Security {
             allow_unencrypted_bind: false,
+            allow_ntlm: false,
             ..Security::default()
         };
 
@@ -725,6 +783,7 @@ mod tests {
         session.set_encrypted(true);
         let security = Security {
             allow_unencrypted_bind: false,
+            allow_ntlm: false,
             ..Security::default()
         };
 
@@ -746,6 +805,7 @@ mod tests {
         let mut session = Session::new();
         let security = Security {
             allow_unencrypted_bind: false,
+            allow_ntlm: false,
             ..Security::default()
         };
 
@@ -777,6 +837,7 @@ mod tests {
                 },
             }]),
             allow_unencrypted_bind: true,
+            allow_ntlm: false,
             ..Security::default()
         };
 
@@ -865,6 +926,19 @@ fn sicily_round(
     // The packages this server can speak. One, and named the way a client compares it: `ldap3`
     // splits the value on `;`, and every Windows dialect spells the package this server checks.
     const PACKAGES: &str = "NTLM";
+
+    // The operator's decision, and answered the same way here as on the SASL path. It comes before
+    // the package discovery round on purpose: advertising `NTLM` and then refusing the first token
+    // is two answers to one question, and the client reports only the first.
+    if !security.allow_ntlm {
+        session.reset();
+        return bind_response(
+            message_id,
+            ResultCode::AuthMethodNotSupported,
+            "NTLMSSP is not enabled on this server: it proves a client with a password hash and no \
+             ticket, so it is off unless the configuration turns it on (sasl.allow_ntlm: true)",
+        );
+    }
 
     if round == Sicily::PackageDiscovery {
         return super::responses::bind_response_with_matched_dn(

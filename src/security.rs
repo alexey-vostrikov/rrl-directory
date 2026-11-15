@@ -216,6 +216,13 @@ pub struct Security {
     pub acl: Acl,
     /// Simple bind over an unencrypted connection is refused when false.
     pub allow_unencrypted_bind: bool,
+    /// Whether NTLMSSP may complete a bind.
+    ///
+    /// Read from `sasl.allow_ntlm`, off unless the operator said otherwise. NTLM proves a client
+    /// with a password hash and nothing else - no ticket, no channel binding - and a domain's
+    /// clients reach for it whenever the KDC is unreachable, so a server that answers it by default
+    /// is a server whose binds are as strong as the weakest mechanism it happens to implement.
+    pub allow_ntlm: bool,
     /// The listener speaks TLS from the first byte (LDAPS).
     pub ldaps: bool,
     /// A certificate and key are configured, so StartTLS can be offered.
@@ -296,6 +303,7 @@ impl Default for Security {
             // Off, like the configuration default: a test or a caller that wants a
             // plaintext bind has to say so, which is the same rule an operator follows.
             allow_unencrypted_bind: false,
+            allow_ntlm: false,
             ldaps: false,
             starttls: false,
             channel_binding: None,
@@ -318,6 +326,7 @@ impl PartialEq for Security {
             && self.passwords == other.passwords
             && self.acl == other.acl
             && self.allow_unencrypted_bind == other.allow_unencrypted_bind
+            && self.allow_ntlm == other.allow_ntlm
             && self.ldaps == other.ldaps
             && self.starttls == other.starttls
             && self.integrity == other.integrity
@@ -345,6 +354,7 @@ impl Security {
             passwords: config.passwords.clone(),
             acl: config.acl.clone(),
             allow_unencrypted_bind: config.allow_unencrypted_bind,
+            allow_ntlm: config.sasl.allow_ntlm,
             ldaps: config.use_tls,
             // Both, because the same certificate serves LDAPS and StartTLS and
             // config load already refuses use_tls without material.

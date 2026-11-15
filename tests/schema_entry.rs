@@ -67,6 +67,7 @@ fn search(
     let directory = directory();
     let security = Security {
         allow_unencrypted_bind: true,
+        allow_ntlm: false,
         ..Security::default()
     };
 

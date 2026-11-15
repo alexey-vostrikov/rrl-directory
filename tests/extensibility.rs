@@ -67,6 +67,7 @@ fn security() -> Arc<Security> {
             .expect("policy"),
         // The fixture binds over a duplex stream, not TLS.
         allow_unencrypted_bind: true,
+        allow_ntlm: false,
         ..Security::default()
     })
 }

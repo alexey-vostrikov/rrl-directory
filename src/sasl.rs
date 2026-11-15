@@ -59,6 +59,25 @@ pub struct SaslConfig {
     /// existed, and the safe default for a server whose KDC may not be an Active Directory.
     #[serde(default)]
     pub pac: crate::pac_policy::PacConfig,
+    /// Whether NTLMSSP may complete a bind, and what it may do.
+    ///
+    /// Off by default, and that is the decision the setting exists to make explicit. NTLM carries
+    /// no ticket and no channel binding: a bind proved with it is a bind proved with a password
+    /// hash, over a session the client itself can seal but nobody can attest. A domain's clients
+    /// fall back to it whenever the KDC is unreachable, and a machine joining the domain always
+    /// does - which is exactly why it is not a default: a server that speaks it without being
+    /// asked accepts a weaker proof than its configuration advertises, and nothing says so.
+    ///
+    /// One line turns it on:
+    ///
+    /// ```yaml
+    /// sasl:
+    ///   allow_ntlm: true
+    /// ```
+    ///
+    /// A server with no `sasl:` section at all cannot speak NTLM either way: the section is what
+    /// says this process serves a domain at all.
+    pub allow_ntlm: bool,
 }
 
 /// One `realms:` entry.
@@ -502,6 +521,7 @@ mod tests {
         // bind.
         let error = Gssapi::load(
             &SaslConfig {
+                allow_ntlm: false,
                 pac: Default::default(),
                 keytab: Some(PathBuf::from("/tmp/nonexistent.keytab")),
                 service_principal: None,
@@ -520,6 +540,7 @@ mod tests {
     fn a_realm_list_without_a_keytab_is_refused() {
         let error = Gssapi::load(
             &SaslConfig {
+                allow_ntlm: false,
                 pac: Default::default(),
                 keytab: None,
                 service_principal: None,
@@ -569,6 +590,7 @@ mod tests {
 
         let gssapi = Gssapi::load(
             &SaslConfig {
+                allow_ntlm: false,
                 pac: Default::default(),
                 keytab: Some(path),
                 service_principal: Some("ldap/host.example.com@EXAMPLE.COM".to_string()),
@@ -618,6 +640,7 @@ mod tests {
 
         let error = Gssapi::load(
             &SaslConfig {
+                allow_ntlm: false,
                 pac: Default::default(),
                 keytab: Some(path),
                 ..SaslConfig::default()
@@ -635,6 +658,7 @@ mod tests {
         // that on a hardened host belongs to root and to the service account.
         Gssapi::validate(
             &SaslConfig {
+                allow_ntlm: false,
                 pac: Default::default(),
                 keytab: Some(PathBuf::from("/root/only/ldap.keytab")),
                 service_principal: None,
@@ -646,6 +670,7 @@ mod tests {
 
         let error = Gssapi::validate(
             &SaslConfig {
+                allow_ntlm: false,
                 pac: Default::default(),
                 keytab: Some(PathBuf::from("/root/only/ldap.keytab")),
                 service_principal: None,
@@ -666,6 +691,7 @@ mod tests {
         let gssapi = Gssapi::load(
             &SaslConfig {
                 pac: Default::default(),
+                allow_ntlm: false,
                 keytab: Some(path),
                 service_principal: None,
                 realms: vec![realm("EXAMPLE.COM", None)],

@@ -55,11 +55,11 @@ attributetype ( 1.2.840.113556.1.4.8 NAME 'userAccountControl'
 
 # The identity an entry had in the directory it came from. Binary in AD; declared as octets here
 # because that is the truth even when the value is carried as text.
-attributetype ( 1.2.840.113556.1.4.146 NAME 'objectGUID'
+attributetype ( 1.2.840.113556.1.4.2 NAME 'objectGUID'
     EQUALITY octetStringMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
 
-attributetype ( 1.2.840.113556.1.4.122 NAME 'objectSid'
+attributetype ( 1.2.840.113556.1.4.146 NAME 'objectSid'
     EQUALITY octetStringMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
 
@@ -69,7 +69,7 @@ attributetype ( 1.2.840.113556.1.4.771 NAME 'servicePrincipalName'
     EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
 
-attributetype ( 1.2.840.113556.1.4.120 NAME 'primaryGroupID'
+attributetype ( 1.2.840.113556.1.4.98 NAME 'primaryGroupID'
     EQUALITY integerMatch ORDERING integerOrderingMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
 
@@ -80,7 +80,7 @@ attributetype ( 1.2.840.113556.1.4.750 NAME 'groupType'
 
 # 0 means "never expires", 0x7FFFFFFFFFFFFFFF means the same thing the other way round. Both
 # spellings exist in the wild, which is why the attribute is declared and not interpreted here.
-attributetype ( 1.2.840.113556.1.4.53 NAME 'accountExpires'
+attributetype ( 1.2.840.113556.1.4.159 NAME 'accountExpires'
     EQUALITY integerMatch ORDERING integerOrderingMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
 
@@ -104,14 +104,14 @@ objectclass ( 1.2.840.113556.1.5.8 NAME 'group' SUP top STRUCTURAL
     MAY ( sAMAccountName $ groupType $ member $ memberOf $ objectGUID $ objectSid $ description ) )
 
 # A computer account: the machine identity Kerberos actually uses most of the time.
-objectclass ( 1.2.840.113556.1.5.5 NAME 'computer' SUP user STRUCTURAL
+objectclass ( 1.2.840.113556.1.3.30 NAME 'computer' SUP user STRUCTURAL
     MAY ( sAMAccountName $ userAccountControl $ servicePrincipalName $ dNSHostName $
           msDS-SupportedEncryptionTypes $ operatingSystem $ operatingSystemVersion ) )
 
 # A plain container, which is what a domain creates for `CN=Computers` and `CN=Users`. Not an
 # `organizationalUnit`: a member's join finds the computers container by GUID and then checks what
 # kind of object it reached, and the class is the answer it reads.
-objectclass ( 1.2.840.113556.1.5.2 NAME 'container' SUP top STRUCTURAL
+objectclass ( 1.2.840.113556.1.3.23 NAME 'container' SUP top STRUCTURAL
     MUST cn
     MAY ( description $ objectGUID $ objectSid $ showInAdvancedViewOnly ) )
 
@@ -171,13 +171,71 @@ attributetype ( 1.2.840.113556.1.4.1414 NAME 'dNSTombstoned'
     EQUALITY booleanMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.7 SINGLE-VALUE )
 
-attributetype ( 1.2.840.113556.1.4.373 NAME 'operatingSystem'
+attributetype ( 1.2.840.113556.1.4.363 NAME 'operatingSystem'
     EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
 
-attributetype ( 1.2.840.113556.1.4.375 NAME 'operatingSystemVersion'
+attributetype ( 1.2.840.113556.1.4.364 NAME 'operatingSystemVersion'
     EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+# --- the attributes of the domain and the configuration partition -------------------------
+#
+# Each of these is written by `provision.rs` on an object this server creates for itself, and a
+# directory that publishes none of them refuses its own bootstrap under `schema: strict` - which is
+# what the stand reported, attribute by attribute, before they were declared. The OIDs are AD's,
+# read from Microsoft's `AD_DS_Attributes__Windows_Server_2016.ldf`.
+#
+# `wellKnownObjects` is DN-Binary in AD (`B:32:<guid>:<dn>`), declared here as octets: the value is a
+# blob whatever it looks like, and a client compares it byte for byte.
+attributetype ( 1.2.840.113556.1.4.618 NAME 'wellKnownObjects'
+    EQUALITY octetStringMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 )
+
+# A bit field: "this is a naming context", "it has no replica locations". A client reads it to decide
+# whether a context is writable here.
+attributetype ( 1.2.840.113556.1.4.375 NAME 'systemFlags'
+    EQUALITY integerMatch ORDERING integerOrderingMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+
+# The domain's functional level, read from the domain object and not from the root DSE.
+attributetype ( 1.2.840.113556.1.4.1459 NAME 'msDS-Behavior-Version'
+    EQUALITY integerMatch ORDERING integerOrderingMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+
+# How many machine accounts a non-administrator may add. A join reads it before creating one.
+attributetype ( 1.2.840.113556.1.4.1411 NAME 'ms-DS-MachineAccountQuota'
+    EQUALITY integerMatch ORDERING integerOrderingMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+
+# The domain's NetBIOS name on its `crossRef` - the attribute a client reads the short name from,
+# not `cn`, which merely holds the same text here.
+attributetype ( 1.2.840.113556.1.4.87 NAME 'nETBIOSName'
+    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+# The naming context a `crossRef` describes, and its DNS name.
+attributetype ( 1.2.840.113556.1.2.16 NAME 'nCName'
+    EQUALITY distinguishedNameMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 SINGLE-VALUE )
+
+attributetype ( 1.2.840.113556.1.4.28 NAME 'dnsRoot'
+    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+# The schema container's own name.
+attributetype ( 1.2.840.113556.1.2.598 NAME 'dmdName'
+    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
+
+# Group policy, declared because AD's `configuration` object permits both.
+attributetype ( 1.2.840.113556.1.4.891 NAME 'gPLink'
+    EQUALITY caseIgnoreMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
+
+attributetype ( 1.2.840.113556.1.4.892 NAME 'gPOptions'
+    EQUALITY integerMatch ORDERING integerOrderingMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
 "#;
 
 /// The bits of `userAccountControl` this server acts on.
@@ -261,6 +319,44 @@ objectclass ( 1.2.840.113556.1.5.86 NAME 'dnsNode' SUP top STRUCTURAL
     MAY ( dnsRecord $ dNSProperty $ dNSTombstoned $ description ) )
 ";
 
+/// The classes of the domain and of the configuration partition, which this server creates for
+/// itself before any client arrives.
+///
+/// With none of them declared, `schema: strict` refused the bootstrap this server had just written:
+/// seventeen violations, one per object and attribute, and every one of them about an object AD
+/// itself would have made. A directory that cannot start in strict mode on its own data is a
+/// directory whose strict mode nobody can turn on - so these are published, OID for OID from
+/// Microsoft's `AD_DS_Schema_2016` class list (`governsID` per class, `systemMayContain` for the
+/// attributes each permits).
+const DOMAIN_CLASSES: &str = "
+# The naming context's own object. `domain` already requires `dc`, which is the RDN's attribute.
+objectclass ( 1.2.840.113556.1.5.67 NAME 'domainDNS' SUP domain STRUCTURAL
+    MAY ( objectSid $ wellKnownObjects $ ms-DS-MachineAccountQuota $ msDS-Behavior-Version $
+          description $ managedBy ) )
+
+# The configuration partition's root.
+objectclass ( 1.2.840.113556.1.5.12 NAME 'configuration' SUP top STRUCTURAL
+    MUST cn
+    MAY ( gPLink $ gPOptions $ description ) )
+
+# `CN=Partitions`, which holds one `crossRef` per naming context.
+objectclass ( 1.2.840.113556.1.5.7000.53 NAME 'crossRefContainer' SUP top STRUCTURAL
+    MUST cn
+    MAY ( description $ msDS-Behavior-Version ) )
+
+# One naming context, as a client reads it: its DN, its DNS name, its NetBIOS name and the flags that
+# say it is writable here.
+objectclass ( 1.2.840.113556.1.3.11 NAME 'crossRef' SUP top STRUCTURAL
+    MUST cn
+    MAY ( nCName $ nETBIOSName $ dnsRoot $ systemFlags $ description ) )
+
+# The schema container's object. This server keeps no schema partition; a client that asks for one by
+# name finds an object rather than nothing.
+objectclass ( 1.2.840.113556.1.3.9 NAME 'dMD' SUP top STRUCTURAL
+    MUST cn
+    MAY ( dmdName $ description ) )
+";
+
 /// Where AD's reading of a standard class differs from X.500's, the AD reading wins.
 ///
 /// Measured against the AD schema Microsoft publishes (`MS-AD_Schema_2K8_R2_Classes.txt`, shipped
@@ -289,6 +385,14 @@ objectclass ( 1.2.840.113556.1.5.9 NAME 'user' SUP organizationalPerson STRUCTUR
           displayName $ telephoneNumber $ title $ description $ memberOf $ unicodePwd $
           sambaNTPassword $ supplementalCredentials $ msDS-KeyVersionNumber $ krb5Key $
           krb5KeyVersionNumber $ krb5PrincipalName $ krb5PrincipalRealm ) )
+
+# AD's computer, which permits the names a member is reached by. `dNSHostName` is the attribute a
+# member searches for to find itself, and this server writes it when it mints a controller account
+# (`--export-keytab`): without it here, strict mode refuses an account the command itself created.
+objectclass ( 1.2.840.113556.1.3.30 NAME 'computer' SUP user STRUCTURAL
+    MAY ( sAMAccountName $ userAccountControl $ servicePrincipalName $ dNSHostName $
+          msDS-SupportedEncryptionTypes $ operatingSystem $ operatingSystemVersion $ objectSid $
+          primaryGroupID ) )
 ";
 
 /// The schema with the AD definitions added.
@@ -299,6 +403,9 @@ objectclass ( 1.2.840.113556.1.5.9 NAME 'user' SUP organizationalPerson STRUCTUR
 pub fn extend(schema: &mut Schema) -> Result<(), String> {
     schema.extend(AD_EXTENSION).map_err(|err| err.to_string())?;
     schema.extend(DNS_CLASSES).map_err(|err| err.to_string())?;
+    schema
+        .extend(DOMAIN_CLASSES)
+        .map_err(|err| err.to_string())?;
     schema.replace(AD_OVERRIDES).map_err(|err| err.to_string())
 }
 
@@ -387,6 +494,50 @@ mod tests {
     /// The zone this server writes itself has to pass its own schema check: a directory in `strict`
     /// mode that refused its own provisioning would be a server that cannot start with `dns:`
     /// enabled, and the complaint would name `dnsNode` as an unknown class.
+    /// Every object this server writes for itself, validated as the bootstrap writes it.
+    ///
+    /// The shapes are taken from `provision`, not written here by hand: a test that built its own
+    /// entries would pass while the server's own bootstrap was refused, and that is exactly how
+    /// seventeen `ObjectClassViolation`s reached the stand with the whole suite green.
+    #[test]
+    fn every_object_the_server_provisions_validates_in_strict_mode() {
+        let schema = with_ad();
+        let base = "dc=ad,dc=example,dc=com";
+
+        let mut entries = crate::provision::Partition {
+            base_dn: base.to_string(),
+            dns_domain: "ad.example.com".to_string(),
+            netbios: "AD".to_string(),
+        }
+        .entries();
+        entries.push(crate::provision::domain_object(
+            base,
+            &crate::sid::Sid::from_bytes(&[
+                1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 232, 3, 0,
+                0,
+            ])
+            .expect("a SID"),
+            "6",
+        ));
+        for dn in crate::provision::containers(base) {
+            entries.push(crate::provision::container_entry(&dn));
+        }
+
+        let mut broken = Vec::new();
+        for entry in &entries {
+            if let Err(violations) = schema.check(entry) {
+                for violation in violations {
+                    broken.push(format!("{}: {}", entry.dn(), violation.detail));
+                }
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "the server's own bootstrap must pass its own schema: {broken:#?}"
+        );
+        assert!(entries.len() >= 6, "and the whole bootstrap was checked");
+    }
+
     #[test]
     fn an_entry_shaped_like_a_dns_zone_and_its_nodes_validates() {
         let schema = with_ad();

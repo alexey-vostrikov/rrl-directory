@@ -244,6 +244,15 @@ pub struct ObjectClass {
     pub kind: ClassKind,
     pub must: Vec<String>,
     pub may: Vec<String>,
+    /// Auxiliary classes every instance carries, `systemAuxiliaryClass` in AD's schema.
+    ///
+    /// AD's `domainDNS` has almost no `MAY` of its own: `objectSid`, `ms-DS-MachineAccountQuota` and
+    /// the rest arrive through `samDomain`, which the engine attaches to every instance. RFC 4512 has
+    /// no such keyword - an auxiliary class is something an *entry* names in its `objectClass` - and
+    /// without it the only way to describe AD's object is to list the attributes by hand, which is a
+    /// transcription that drifts. So the vocabulary carries it as `AUXCLASS`, and the allowance is
+    /// computed from it.
+    pub aux: Vec<String>,
 }
 
 impl ObjectClass {
@@ -292,6 +301,13 @@ impl ObjectClass {
                 parts.push(format!("MAY {}", self.may[0]));
             } else {
                 parts.push(format!("MAY ( {} )", self.may.join(" $ ")));
+            }
+        }
+        if !self.aux.is_empty() {
+            if self.aux.len() == 1 {
+                parts.push(format!("AUXCLASS {}", self.aux[0]));
+            } else {
+                parts.push(format!("AUXCLASS ( {} )", self.aux.join(" $ ")));
             }
         }
         parts.push(")".to_string());
@@ -588,6 +604,10 @@ impl Schema {
                 may.insert(attribute.to_lowercase());
             }
             pending.extend(class.sup.iter().map(|sup| sup.to_lowercase()));
+            // An auxiliary class the definition attaches (`systemAuxiliaryClass` in AD's schema):
+            // its own `MUST`/`MAY` belong to every instance, which is how `domainDNS` comes to
+            // permit `objectSid` and `ms-DS-MachineAccountQuota` without naming them.
+            pending.extend(class.aux.iter().map(|aux| aux.to_lowercase()));
         }
 
         Some((must, may))
@@ -1010,6 +1030,7 @@ fn parse_object_class(tokens: &[String]) -> Result<ObjectClass, SchemaError> {
         kind: ClassKind::Structural,
         must: Vec::new(),
         may: Vec::new(),
+        aux: Vec::new(),
     };
 
     while let Some(keyword) = cursor.word() {
@@ -1025,6 +1046,9 @@ fn parse_object_class(tokens: &[String]) -> Result<ObjectClass, SchemaError> {
             "AUXILIARY" => class.kind = ClassKind::Auxiliary,
             "MUST" => class.must = cursor.list()?,
             "MAY" => class.may = cursor.list()?,
+            // AD's `systemAuxiliaryClass`, which RFC 4512 does not have: an auxiliary class the
+            // engine attaches to every instance of this one.
+            "AUXCLASS" | "SYSTEMAUXCLASS" => class.aux = cursor.list()?,
             other => return Err(SchemaError::UnknownClassKind(other.to_string())),
         }
     }
@@ -1049,7 +1073,7 @@ const ATTRIBUTE_KEYWORDS: [&str; 11] = [
     "USAGE",
 ];
 
-const CLASS_KEYWORDS: [&str; 9] = [
+const CLASS_KEYWORDS: [&str; 11] = [
     "NAME",
     "DESC",
     "OBSOLETE",
@@ -1057,6 +1081,8 @@ const CLASS_KEYWORDS: [&str; 9] = [
     "ABSTRACT",
     "STRUCTURAL",
     "AUXILIARY",
+    "AUXCLASS",
+    "SYSTEMAUXCLASS",
     "MUST",
     "MAY",
 ];
@@ -1619,6 +1645,52 @@ attributetype ( 2.5.4.41 NAME 'name'
 
 #[cfg(test)]
 mod source_tests {
+    /// A class that attaches an auxiliary one permits what that class permits.
+    ///
+    /// This is AD's `systemAuxiliaryClass`, and the reason it is in the engine rather than in the
+    /// AD vocabulary: `domainDNS` names `samDomain`, and `objectSid` reaches the domain object
+    /// through it. Computed by hand it would be a list that drifts from the published schema.
+    #[test]
+    fn an_attached_auxiliary_class_contributes_its_attributes() {
+        let mut schema = Schema::core();
+        schema
+            .extend(
+                "attributetype ( 1.3.6.1.4.1.99999.1 NAME 'objectSidLike' SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 )
+                 attributetype ( 1.3.6.1.4.1.99999.2 NAME 'quotaLike' SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 )
+                 objectclass ( 1.3.6.1.4.1.99999.3 NAME 'sidCarrier' SUP top AUXILIARY
+                     MAY ( objectSidLike $ quotaLike ) )
+                 objectclass ( 1.3.6.1.4.1.99999.4 NAME 'thingWithSid' SUP top STRUCTURAL
+                     MUST cn AUXCLASS sidCarrier )",
+            )
+            .expect("the vocabulary parses");
+
+        let (must, may) = schema
+            .allowed_attributes("thingWithSid")
+            .expect("the class is known");
+        assert!(must.contains("cn"));
+        assert!(
+            may.contains("objectsidlike") && may.contains("quotalike"),
+            "the auxiliary class contributes: {may:?}"
+        );
+
+        // And an entry may carry the attribute, which is what "permitted" has to mean.
+        let entry = Entry::new(
+            "cn=x,dc=example,dc=com",
+            crate::model::Attributes::new()
+                .push(crate::model::Attribute::new(
+                    "objectClass",
+                    vec!["top".to_string(), "thingWithSid".to_string()],
+                ))
+                .push(crate::model::Attribute::single("cn", "x"))
+                .push(crate::model::Attribute::single("objectSidLike", "AAECAw==").binary()),
+        );
+        assert!(
+            schema.check(&entry).is_ok(),
+            "an attribute the auxiliary class permits must validate: {:?}",
+            schema.check(&entry).err()
+        );
+    }
+
     use super::*;
 
     const DRINK: &str = "attributeType ( 1.3.6.1.4.1.59999.2.1 NAME 'favouriteDrink' \

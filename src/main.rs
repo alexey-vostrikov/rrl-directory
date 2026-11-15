@@ -28,6 +28,35 @@ fn serves_a_domain(config: &config::Config) -> bool {
     false
 }
 
+/// The name a client reaches this controller by.
+///
+/// One function, because two things publish it and they must agree: the root DSE's `dnsHostName` and
+/// the `LogonServer` of a PAC. A client that reaches a controller by the name it was told and finds a
+/// different one in the ticket has no field in which to say so.
+///
+/// `cldap.dns_host` first, because an operator who set it has decided the name. Otherwise the SMB
+/// name under the domain, and `localhost` when neither section says anything.
+#[cfg(feature = "kdc")]
+fn advertised_host(config: &config::Config) -> String {
+    if let Some(host) = config.cldap.dns_host.clone() {
+        return host;
+    }
+    #[cfg(feature = "smb")]
+    if let Some(domain) = config.smb.dns_domain.as_ref() {
+        return format!(
+            "{}.{}",
+            config
+                .smb
+                .netbios_name
+                .clone()
+                .unwrap_or_else(|| "localhost".to_string())
+                .to_lowercase(),
+            domain
+        );
+    }
+    "localhost".to_string()
+}
+
 async fn serve() {
     let args: config::Args = cli::Cli::parse().into();
     let export = args.export_ldif.clone();
@@ -534,7 +563,9 @@ async fn serve() {
         _ => None,
     };
     #[cfg(not(feature = "kdc"))]
-    let partition = None;
+    // Underscored and annotated: both the type and every reader of this binding live in the `kdc`
+    // path above and below, so without that feature the value is unused and has no type to infer.
+    let _partition: Option<rrl_directory::provision::Partition> = None;
 
     // Before the first write, because a change stamped before this point carries the id of
     // "no node" and a peer could not tell it from its own.
@@ -662,25 +693,7 @@ async fn serve() {
     #[cfg(feature = "kdc")]
     let security = match config.kerberos.realm.as_deref() {
         Some(realm) if config.kerberos.enabled => {
-            let host = config
-                .cldap
-                .dns_host
-                .clone()
-                .or_else(|| {
-                    config.smb.dns_domain.as_ref().map(|domain| {
-                        format!(
-                            "{}.{}",
-                            config
-                                .smb
-                                .netbios_name
-                                .clone()
-                                .unwrap_or_else(|| "localhost".to_string())
-                                .to_lowercase(),
-                            domain
-                        )
-                    })
-                })
-                .unwrap_or_else(|| "localhost".to_string());
+            let host = advertised_host(&config);
             security.with_ad_names(rrl_directory::security::AdNames {
                 dns_host_name: host.clone(),
                 ldap_service_name: format!("{realm}:host/{host}@{realm}"),
@@ -941,7 +954,10 @@ async fn serve() {
         let settings =
             match rrl_directory::kerberos::Settings::resolve(&config.kerberos, &config.base_dn, ip)
             {
-                Ok(settings) => settings,
+                // The name goes into the PAC as `LogonServer`: it is what a client shows as the
+                // controller that authenticated it, and it is the same name the root DSE publishes,
+                // so one function spells it for both.
+                Ok(settings) => settings.with_logon_server(advertised_host(&config)),
                 Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
             };
         match rrl_directory::kerberos::serve::start(

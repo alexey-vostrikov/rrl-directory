@@ -122,6 +122,23 @@ impl RealmView {
         self.first_complete(|entry| matches(entry))
     }
 
+    /// The complete record for `principal`, for a reader that needs the attributes.
+    ///
+    /// The realm's own `get` answers in Heimdal's vocabulary — keys, `kvno`, validity — because that
+    /// is what a KDC asks for. A PAC asks about `objectSid`, `primaryGroupID` and `memberOf`, which
+    /// that mapping does not carry, so the entry itself is what the issuer needs.
+    pub fn record_for(&self, principal: &Principal) -> Option<Entry> {
+        self.entry_for(principal)
+    }
+
+    /// The complete record for `dn`, read from the store when the snapshot holds only skeletons.
+    ///
+    /// This is how a group named in `memberOf` is resolved: the value is a DN, and its `objectSid`
+    /// is not in the snapshot a restarted server holds.
+    pub fn record(&self, dn: &str) -> Option<Entry> {
+        self.current().record(dn).map(|entry| entry.into_owned())
+    }
+
     /// The first entry whose *complete* record matches, read one DN at a time.
     ///
     /// A scan is already the fallback - the canonical DN answers a lookup in one read - and this

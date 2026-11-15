@@ -2349,7 +2349,7 @@ dependencies = [
 [[package]]
 name = "rrl-kdc"
 version = "0.1.0"
-source = "git+https://github.com/alexey-vostrikov/rrl-kdc?branch=main#16b489f9895ed08ae9bf9835c8a70a505c8f8a67"
+source = "git+https://github.com/alexey-vostrikov/rrl-kdc?branch=main#3d79124a6e03cd587f3838052026d9673bb7e8a8"
 dependencies = [
  "hmac 0.13.0",
  "rrl-crypto",

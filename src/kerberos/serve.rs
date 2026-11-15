@@ -315,13 +315,24 @@ pub async fn start(
         // standalone KDC keeps it, because renaming a client that did not ask is what RFC 6806 §6
         // warns about.
         .with_enterprise_requires_canonicalize(false);
-    let kdc = Arc::new(Kdc::new(
-        config,
-        Arc::new(LdapHdb::new(
-            Arc::clone(&view) as Arc<dyn rrl_kdc::hdb::ldap::Directory>
-        )),
-        Arc::new(OwnCipher),
+    // The PAC, issued out of this directory. Without an issuer `rrl-kdc` issues tickets with no PAC
+    // at all, which is right for a Kerberos-only realm and wrong for a Windows domain: a service
+    // builds its token from the PAC, and a member server refuses a logon it cannot see groups for.
+    let pac = Arc::new(super::pac_issuer::DirectoryPacIssuer::new(
+        Arc::clone(&view),
+        &settings.realm,
+        settings.logon_server.clone(),
     ));
+    let kdc = Arc::new(
+        Kdc::new(
+            config,
+            Arc::new(LdapHdb::new(
+                Arc::clone(&view) as Arc<dyn rrl_kdc::hdb::ldap::Directory>
+            )),
+            Arc::new(OwnCipher),
+        )
+        .with_pac_issuer(pac),
+    );
 
     // Both transports on one port, and a failure to take either is a failure to start: a realm that
     // answers TCP and not UDP is a realm half the clients cannot reach, and they report it as a

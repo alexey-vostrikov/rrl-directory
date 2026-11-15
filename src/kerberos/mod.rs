@@ -25,6 +25,7 @@
 
 pub mod bootstrap;
 pub mod machine_password;
+pub mod pac_issuer;
 pub mod realm;
 pub mod schema;
 pub mod secrets;
@@ -70,6 +71,24 @@ pub struct Settings {
     pub realm: String,
     /// Where to listen, both transports.
     pub bind: SocketAddr,
+    /// The name a client reaches this controller by, `dc1.example.com`.
+    ///
+    /// Written into a PAC as `LogonServer`, which is the field a client shows as the controller that
+    /// authenticated it. Empty when the operator's configuration names no host: the field is
+    /// informational, and a name invented here would be a claim about which controller answered.
+    pub logon_server: String,
+}
+
+impl Settings {
+    /// The same settings, naming the controller a client reaches.
+    ///
+    /// A builder rather than a `resolve` argument: `resolve` answers the fields that must agree with
+    /// each other, and this one is a name the deployment already decided elsewhere.
+    #[must_use]
+    pub fn with_logon_server(mut self, name: impl Into<String>) -> Self {
+        self.logon_server = name.into();
+        self
+    }
 }
 
 impl Settings {
@@ -115,6 +134,7 @@ impl Settings {
         Ok(Settings {
             realm,
             bind: SocketAddr::new(ip, port),
+            logon_server: String::new(),
         })
     }
 }

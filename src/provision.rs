@@ -23,6 +23,18 @@ use crate::model::{Attribute, Attributes, Entry};
 pub const CONTAINER_CLASS: &str = "container";
 
 /// The containers a domain root holds from the start, as DNs under `base_dn`.
+/// `entry` with the attributes AD writes into every object it creates, and its SID untouched.
+///
+/// The funnel and the provisioners all call [`crate::ad_derived::synthesised`]; this is the same
+/// call for an entry that is not going through the funnel, so that a store is never written with a
+/// shape the schema it publishes would refuse to read back.
+#[must_use]
+pub fn stored(schema: &crate::schema::Schema, base_dn: &str, entry: Entry) -> Entry {
+    let attributes =
+        crate::ad_derived::synthesised_for(schema, entry.dn(), entry.attributes(), base_dn);
+    Entry::new(entry.dn().to_string(), attributes)
+}
+
 pub fn containers(base_dn: &str) -> Vec<String> {
     vec![format!("cn=computers,{base_dn}")]
 }
@@ -113,6 +125,20 @@ impl Partition {
         ]
     }
 
+    /// The entries with AD's synthesised attributes written in, as every writer stores them.
+    ///
+    /// Wrapped around [`Self::entries`] rather than inside it so the shapes stay readable and this
+    /// one place says where the attributes come from: AD's `top` class requires `objectCategory`,
+    /// `instanceType` and `nTSecurityDescriptor` on every object, and a store whose bootstrap
+    /// entries lack them is refused by the very schema the store publishes.
+    #[must_use]
+    pub fn storable(&self, schema: &crate::schema::Schema) -> Vec<Entry> {
+        self.entries()
+            .into_iter()
+            .map(|entry| stored(schema, &self.base_dn, entry))
+            .collect()
+    }
+
     /// Creates the ones that are missing, and says which it created.
     pub async fn ensure(&self, backend: &Backend) -> Result<Vec<String>, String> {
         let existing: Vec<String> = backend
@@ -125,7 +151,7 @@ impl Partition {
             .collect();
 
         let mut created = Vec::new();
-        for entry in self.entries() {
+        for entry in self.storable(&crate::schema::Schema::core()) {
             if existing
                 .iter()
                 .any(|have| have.eq_ignore_ascii_case(entry.dn()))
@@ -212,7 +238,11 @@ fn with_guid(attributes: Attributes) -> Attributes {
 /// Missing is read from the store rather than assumed: a directory grown from an import already
 /// has them, and a second `add` of the same DN would either be refused by the write path or, worse
 /// on a backend that does not check, hold the entry twice.
-pub async fn ensure_containers(backend: &Backend, base_dn: &str) -> Result<Vec<String>, String> {
+pub async fn ensure_containers(
+    backend: &Backend,
+    base_dn: &str,
+    schema: &crate::schema::Schema,
+) -> Result<Vec<String>, String> {
     let data = backend
         .load()
         .await
@@ -230,7 +260,10 @@ pub async fn ensure_containers(backend: &Backend, base_dn: &str) -> Result<Vec<S
         }
         backend
             .apply(&[EntryChange::Upsert {
-                entry: container_entry(&dn),
+                // Stored the way every writer stores an entry: AD's `top` class requires
+                // `objectCategory`, `instanceType` and `nTSecurityDescriptor`, so a container written
+                // without them is one the schema this store publishes refuses to read back.
+                entry: stored(schema, base_dn, container_entry(&dn)),
             }])
             .await
             .map_err(|err| format!("'{dn}' could not be created: {err}"))?;

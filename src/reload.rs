@@ -122,6 +122,14 @@ pub const DEFAULT_REWRITE_MIN_SECONDS: u64 = 60;
 pub struct Source {
     backend: Arc<Backend>,
     base_dn: String,
+    /// Where a security principal's SID comes from, when this server issues them.
+    ///
+    /// AD's `securityPrincipal` auxiliary class makes `objectSid` **required** on every user, group
+    /// and machine account, so a directory that publishes AD's schema and then writes a user without
+    /// one has written an object its own schema refuses. The DSA allocates the RID at `add`, and this
+    /// is the same moment: the funnel every write goes through. `None` on a deployment with no
+    /// domain, where there is no RID space to allocate from and no SID to name.
+    sid_issuer: std::sync::OnceLock<Arc<crate::sid::domain::Issuer>>,
     users_ou_name: String,
     groups_ou_name: String,
     /// The snapshot every connection reads from.
@@ -641,6 +649,50 @@ impl Source {
     /// answering in seconds rather than minutes. The part that follows - the journal head, the
     /// schema check, the memory report, the source itself - is the same either way, and duplicating
     /// it would be the one place the two paths could start to differ.
+    /// Gives the entries this directory invents for itself the attributes AD writes into every
+    /// object.
+    ///
+    /// The naming context and the two organizational units are nowhere on a backend that stores no
+    /// entries: `Directory::new` builds them and has no schema to ask. On a domain controller AD's
+    /// `top` class requires `objectCategory`, `instanceType` and `nTSecurityDescriptor` on every
+    /// object, so without this those three are the only entries in the directory that its own schema
+    /// refuses - which is what a strict start reported, seventeen violations and no listener.
+    ///
+    /// Only these three. An entry that came out of the store without them is a store written before
+    /// the write funnel synthesised them, and that is a fact the operator has to see rather than
+    /// something a start should silently rewrite.
+    fn adopt_own_containers(directory: &mut Directory, config: &Config) {
+        if config.schema.attribute("objectCategory").is_none() {
+            return;
+        }
+        let mut dns = vec![directory.base_dn().to_string()];
+        for name in [
+            config.users_ou_name.to_lowercase(),
+            config.groups_ou_name.to_lowercase(),
+        ] {
+            dns.push(directory.ou_dn(&name));
+        }
+
+        for dn in dns {
+            let Some(entry) = directory.find(&dn).cloned() else {
+                continue;
+            };
+            if entry.attributes().get("objectCategory").is_some() {
+                continue;
+            }
+            let attributes =
+                crate::ad_derived::synthesised(entry.dn(), entry.attributes(), directory.base_dn());
+            let entry = crate::model::Entry::new(entry.dn().to_string(), attributes);
+            if let Err(err) = directory.replace_entry_in_place(entry, &config.indexes) {
+                tracing::warn!(
+                    dn,
+                    %err,
+                    "ad: the attributes AD requires on every object were not written to a container"
+                );
+            }
+        }
+    }
+
     fn finish(
         config: &Config,
         backend: Arc<Backend>,
@@ -650,15 +702,17 @@ impl Source {
     ) -> Result<(Arc<Self>, Arc<Directory>), BackendError> {
         let head = backend.journal_head()?;
         let floor = backend.journal_floor()?;
-        let directory = Arc::new(directory.with_csn(head).with_floor(floor));
+        let mut directory = directory.with_csn(head).with_floor(floor);
 
         // A snapshot of identities has nothing to check: its entries carry a DN and no attributes,
         // and every attribute they will ever show came from a record that was checked when it was
         // written. Checking here would report three million entries missing `objectClass` and
         // refuse to start under `strict` - which is the opposite of what the mode is for.
         if !directory.is_skeleton() {
+            Self::adopt_own_containers(&mut directory, config);
             check_schema(&directory, &config.schema, config.schema_mode)?;
         }
+        let directory = Arc::new(directory);
 
         // Said once, at start, against the ceiling the operator set. Not a refusal: see
         // `crate::memory` for why an unavailable server is the worse failure.
@@ -686,6 +740,7 @@ impl Source {
 
         let source = Arc::new(Self {
             base_dn: config.base_dn.clone(),
+            sid_issuer: std::sync::OnceLock::new(),
             users_ou_name: config.users_ou_name.clone(),
             groups_ou_name: config.groups_ou_name.clone(),
             current: Arc::new(RwLock::new(Arc::clone(&directory))),
@@ -705,6 +760,19 @@ impl Source {
         });
 
         Ok((source, directory))
+    }
+
+    /// Hands this source the domain's RID allocator, so that a new security principal gets a SID.
+    ///
+    /// A setter rather than a parameter of `load`: the issuer is opened from the store's own
+    /// metadata, after the store itself is open, and a source that needed it at construction would
+    /// make the two take turns - the issuer cannot exist before the backend, and the backend is
+    /// what `load` opens.
+    pub fn assign_sid_issuer(&self, issuer: Arc<crate::sid::domain::Issuer>) {
+        // `set` and not a store: the issuer is opened once, and a second call would mean two
+        // allocators handing out the same numbers. A `OnceLock` behind `&self` is what lets the
+        // source be in an `Arc` before the store has been read far enough to open one.
+        let _ = self.sid_issuer.set(issuer);
     }
 
     /// How strictly this server enforces its schema, for a decision taken outside a reload.
@@ -928,7 +996,87 @@ impl Source {
     /// thousand entries and growing linearly, so a hundred thousand entries would have made a
     /// single `modify` take about half a second while the directory was being read by everyone
     /// else.
+    /// The change set with AD's synthesised attributes written into every entry it upserts.
+    ///
+    /// Only `Upsert` carries an entry; a `User`/`Group` change is this server's own typed form, and
+    /// the value it becomes on disk is an entry the import and the write path build separately.
+    fn synthesised(&self, changes: &[EntryChange]) -> Vec<EntryChange> {
+        // The schema the write path checks against, not a flag: a plain directory has no
+        // `objectCategory` to carry, and writing one would be refused by the very check that
+        // follows. Read once outside the loop because the loop is per entry.
+        let schema = crate::security::current_schema(&self.schema);
+        changes
+            .iter()
+            .map(|change| match change {
+                EntryChange::Upsert { entry } => {
+                    let mut attributes = crate::ad_derived::synthesised_for(
+                        &schema,
+                        entry.dn(),
+                        entry.attributes(),
+                        &self.base_dn,
+                    );
+                    if let Some(sid) = self.allocate_sid(entry, &attributes) {
+                        attributes = attributes.push(sid.attribute("objectSid"));
+                    }
+                    EntryChange::Upsert {
+                        entry: crate::model::Entry::new(entry.dn().to_string(), attributes),
+                    }
+                }
+                other => other.clone(),
+            })
+            .collect()
+    }
+
+    /// A SID for an entry that is a security principal and has none, or `None`.
+    ///
+    /// AD's `securityPrincipal` class requires `objectSid` and its `sAMAccountName`, and a `user`,
+    /// `group` or machine account inherits it. So the object is refused by AD's own schema if it has
+    /// no SID, and the moment to give it one is the moment the object is created - which is here,
+    /// in the funnel every write passes through, and not in each writer.
+    ///
+    /// Nothing is allocated when the entry already has a SID (an import from AD, an account this
+    /// server made earlier), or when the deployment has no domain to allocate from.
+    fn allocate_sid(
+        &self,
+        entry: &crate::model::Entry,
+        attributes: &crate::model::Attributes,
+    ) -> Option<crate::sid::Sid> {
+        let issuer = self.sid_issuer.get()?;
+        if attributes.get("objectSid").is_some() {
+            return None;
+        }
+        let classes = attributes.get(crate::model::ATTR_OBJECT_CLASS)?;
+        let is_principal = classes
+            .values
+            .iter()
+            .any(|class| crate::ad_vocabulary::has_auxiliary(class, "securityPrincipal"));
+        if !is_principal {
+            return None;
+        }
+        match issuer.take() {
+            Ok(sid) => {
+                tracing::info!(
+                    dn = entry.dn(),
+                    sid = %sid,
+                    "ad: allocated a SID for a new security principal"
+                );
+                Some(sid)
+            }
+            Err(err) => {
+                // Not a refusal of the write: an account without a SID is still an account, and
+                // failing the add would make the allocator's trouble look like a client's error.
+                tracing::warn!(dn = entry.dn(), %err, "ad: no RID could be issued");
+                None
+            }
+        }
+    }
+
     pub async fn apply(&self, changes: &[EntryChange]) -> Result<usize, BackendError> {
+        // The attributes AD writes into every object it creates, filled in here because this is the
+        // one funnel every write goes through: LDAP `add`, `samr_CreateUser2`, the keytab export, an
+        // import. Written rather than computed on read, so they are stored, indexed and filterable -
+        // `objectCategory` carries an index in AD for exactly that reason.
+        let changes = &self.synthesised(changes);
         if let Some(entries) = self.apply_in_place(changes).await? {
             self.announce(changes);
             return Ok(entries);

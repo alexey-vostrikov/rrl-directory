@@ -272,9 +272,17 @@ pub fn handle_add(
         }
     }
 
+    let published = crate::security::current_schema(&security.schema);
+
+    // The attributes AD writes into every object it creates, before the schema check for the same
+    // reason the SID is assigned above: AD's `top` class *requires* them, so checking an entry that
+    // does not have them yet would refuse a write AD itself would accept. The write funnel applies
+    // this again and finds nothing to do, which is what makes it safe in both places - and on a
+    // plain directory `synthesised_for` adds nothing, because there is no AD vocabulary to obey.
+    let attributes =
+        crate::ad_derived::synthesised_for(&published, &entry_dn, &attributes, directory.base_dn());
     let entry = Entry::new(entry_dn.clone(), attributes);
 
-    let published = crate::security::current_schema(&security.schema);
     if let Err((code, detail)) = schema_verdict(&published, security.schema_mode, &entry) {
         return reject(response(code, &detail));
     }
@@ -662,6 +670,9 @@ mod tests {
                 attribute("objectClass", vec!["top", "person", "user"]),
                 attribute("cn", vec!["alice"]),
                 attribute("sn", vec!["Surname"]),
+                // AD's `securityPrincipal` class requires a logon name, and an account without one
+                // cannot be logged in as even if it holds a SID.
+                attribute("sAMAccountName", vec!["alice"]),
             ],
         };
 

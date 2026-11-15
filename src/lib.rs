@@ -14,6 +14,7 @@
 #![deny(unsafe_code)]
 
 pub mod acl;
+pub mod ad_derived;
 pub mod ad_schema;
 pub mod ad_vocabulary;
 pub mod backend;

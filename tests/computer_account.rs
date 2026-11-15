@@ -61,47 +61,69 @@ async fn source(path: &std::path::Path, keytab: &std::path::Path) -> (Arc<Source
         Some(&serde_json::json!({"path": path.display().to_string()})),
     )
     .expect("backend");
-    backend
-        .apply(&[
-            // The container the member's account is created in. An `add` needs its parent to exist,
-            // and in a domain that container is there before any member arrives - `CN=Computers` is
-            // created with the domain. An `organizationalRole` is the core-schema class whose only
-            // requirement is a `cn`, which is what this one is: a place for other entries.
-            EntryChange::Upsert {
-                entry: Entry::new(
-                    "cn=computers,dc=ad,dc=example,dc=com",
-                    Attributes::new()
-                        .push(Attribute::new(
-                            "objectClass",
-                            vec!["top".to_string(), "organizationalRole".to_string()],
-                        ))
-                        .push(Attribute::single("cn", "computers")),
-                ),
-            },
-            EntryChange::Upsert {
-                entry: Entry::new(
-                    ADMIN_DN,
-                    // A core-schema entry: the source loads with `Schema::core()` before any extension
-                    // is named in the configuration, and an `inetOrgPerson` is enough for an identity
-                    // the test binds as. Whether the administrator is an AD `user` is not what this
-                    // test is about.
-                    Attributes::new()
-                        .push(Attribute::new(
-                            "objectClass",
-                            vec![
-                                "top".to_string(),
-                                "person".to_string(),
-                                "organizationalPerson".to_string(),
-                                "inetOrgPerson".to_string(),
-                            ],
-                        ))
-                        .push(Attribute::single("cn", "administrator"))
-                        .push(Attribute::single("sn", "Administrator")),
-                ),
-            },
-        ])
-        .await
-        .expect("seed");
+    // The vocabulary the configuration above asks for: AD's over the core, because a keytab is
+    // named and the server therefore publishes AD's object classes.
+    let mut source_schema = rrl_directory::schema::Schema::core();
+    rrl_directory::ad_schema::extend(&mut source_schema).expect("ad");
+    rrl_directory::kerberos::schema::extend(&mut source_schema).expect("realm");
+
+    let seeded: Vec<EntryChange> = [
+        // The container the member's account is created in. An `add` needs its parent to exist,
+        // and in a domain that container is there before any member arrives - `CN=Computers` is
+        // created with the domain. An `organizationalRole` is the core-schema class whose only
+        // requirement is a `cn`, which is what this one is: a place for other entries.
+        EntryChange::Upsert {
+            entry: Entry::new(
+                "cn=computers,dc=ad,dc=example,dc=com",
+                Attributes::new()
+                    .push(Attribute::new(
+                        "objectClass",
+                        vec!["top".to_string(), "organizationalRole".to_string()],
+                    ))
+                    .push(Attribute::single("cn", "computers")),
+            ),
+        },
+        EntryChange::Upsert {
+            entry: Entry::new(
+                ADMIN_DN,
+                // A core-schema entry: the source loads with `Schema::core()` before any extension
+                // is named in the configuration, and an `inetOrgPerson` is enough for an identity
+                // the test binds as. Whether the administrator is an AD `user` is not what this
+                // test is about.
+                Attributes::new()
+                    .push(Attribute::new(
+                        "objectClass",
+                        vec![
+                            "top".to_string(),
+                            "person".to_string(),
+                            "organizationalPerson".to_string(),
+                            "inetOrgPerson".to_string(),
+                        ],
+                    ))
+                    .push(Attribute::single("cn", "administrator"))
+                    .push(Attribute::single("sn", "Administrator"))
+                    // AD's `inetOrgPerson` subclasses `user`, which carries `securityPrincipal`,
+                    // and that class makes a SID required: an account without one is not an
+                    // account AD can hand out rights to. The write path allocates it; a seed
+                    // written straight into the store has to say it.
+                    .push(Attribute::single("objectSid", "AQUAAAAAAAUVAAAA").binary())
+                    .push(Attribute::single("sAMAccountName", "administrator")),
+            ),
+        },
+    ]
+    .into_iter()
+    // Through the same call the write funnel makes, because a store is only ever written with the
+    // attributes AD requires on every object: `top` demands `objectCategory`, `instanceType` and
+    // `nTSecurityDescriptor`, and a seed that skipped them would be seeding a store this server
+    // refuses to load - which is what this test did before the funnel synthesised them.
+    .map(|change| match change {
+        EntryChange::Upsert { entry } => EntryChange::Upsert {
+            entry: rrl_directory::provision::stored(&source_schema, BASE, entry),
+        },
+        other => other,
+    })
+    .collect();
+    backend.apply(&seeded).await.expect("seed");
 
     let (source, _) = Source::load(&config, backend.clone()).await.expect("load");
     (source, backend)

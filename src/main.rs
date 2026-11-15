@@ -633,7 +633,9 @@ async fn serve() {
     let smb = false;
 
     if config.cldap.enabled || realm || smb {
-        match rrl_directory::provision::ensure_containers(&backend, &config.base_dn).await {
+        match rrl_directory::provision::ensure_containers(&backend, &config.base_dn, &config.schema)
+            .await
+        {
             Ok(created) if !created.is_empty() => {
                 eprintln!("provision: created {}", created.join(", "));
             }
@@ -735,10 +737,14 @@ async fn serve() {
                 // here rather than with the containers because it needs that SID, and the SID needs
                 // the store: a domain object with an invented one would describe another domain.
                 if partition.is_some() {
-                    let entry = rrl_directory::provision::domain_object(
+                    let entry = rrl_directory::provision::stored(
+                        &config.schema,
                         &config.base_dn,
-                        &issuer.sid(),
-                        config.emulation.functionality(),
+                        rrl_directory::provision::domain_object(
+                            &config.base_dn,
+                            &issuer.sid(),
+                            config.emulation.functionality(),
+                        ),
                     );
                     let dn = entry.dn().to_string();
                     match backend
@@ -810,6 +816,14 @@ async fn serve() {
         Ok(loaded) => loaded,
         Err(err) => fatal(&i18n::t("error.backend", &[("detail", &err.to_string())])),
     };
+    // The RID allocator, handed to the write funnel: AD's `securityPrincipal` class makes
+    // `objectSid` required on every account, group and machine, so an entry a client creates has to
+    // leave the funnel with one. `None` on a plain directory, where there is no domain to number
+    // from and no client asking for a SID.
+    #[cfg(feature = "kdc")]
+    if let Some(domain) = &domain {
+        source.assign_sid_issuer(Arc::clone(domain));
+    }
     // The same schema handle the source holds: a reload through the source has to reach
     // the write path, and a copy would make the two disagree after the first reload.
     // Read once, here: a keytab is a secret that belongs to root and to the service account, and

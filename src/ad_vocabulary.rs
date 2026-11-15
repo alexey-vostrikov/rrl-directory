@@ -141,15 +141,15 @@ fn ldap_syntax(om_syntax: Option<&str>, om_object_class: Option<&str>) -> &'stat
         Some("23") => "1.3.6.1.4.1.1466.115.121.1.23",              // UTCTime
         Some("24") => "1.3.6.1.4.1.1466.115.121.1.24",              // GeneralizedTime
         Some("64") => "1.3.6.1.4.1.1466.115.121.1.15",              // Unicode
-        Some("127") => {
+        // `127` is "an octet string, unless its object class says otherwise", and the only class
+        // AD uses it with that says otherwise is `DN` (2.5.5.1 hedged in `oMObjectClass`).
+        Some("127")
             if om_object_class
-                .is_some_and(|class| class.eq_ignore_ascii_case("2a864886f71401010101"))
-            {
-                "1.3.6.1.4.1.1466.115.121.1.12" // DN
-            } else {
-                "1.3.6.1.4.1.1466.115.121.1.40"
-            }
+                .is_some_and(|class| class.eq_ignore_ascii_case("2a864886f71401010101")) =>
+        {
+            "1.3.6.1.4.1.1466.115.121.1.12"
         }
+        Some("127") => "1.3.6.1.4.1.1466.115.121.1.40",
         _ => "1.3.6.1.4.1.1466.115.121.1.40", // OctetString
     }
 }
@@ -332,6 +332,56 @@ pub fn object_category(classes: &[String], base_dn: &str) -> Option<String> {
     None
 }
 
+/// Whether `class` carries `auxiliary` among the auxiliary classes AD attaches to it.
+///
+/// Walks the `SUP` chain: `computer` does not name `securityPrincipal` itself, it inherits it from
+/// `user`. Asked of AD's file rather than hard-coded, so a class the file changes is followed here.
+#[must_use]
+pub fn has_auxiliary(class: &str, auxiliary: &str) -> bool {
+    /// A class's superior and the auxiliary classes it attaches.
+    type Attached = (Option<String>, Vec<String>);
+    static CACHE: std::sync::OnceLock<BTreeMap<String, Attached>> = std::sync::OnceLock::new();
+    let classes = CACHE.get_or_init(|| {
+        let mut out: BTreeMap<String, Attached> = BTreeMap::new();
+        for entry in entries(CLASSES_LDF) {
+            let Some(name) = first(&entry, "ldapdisplayname") else {
+                continue;
+            };
+            let mut aux = all(&entry, "auxiliaryclass");
+            aux.extend(all(&entry, "systemauxiliaryclass"));
+            out.insert(
+                name.to_ascii_lowercase(),
+                (
+                    first(&entry, "subclassof").map(str::to_ascii_lowercase),
+                    aux.iter().map(|name| name.to_ascii_lowercase()).collect(),
+                ),
+            );
+        }
+        out
+    });
+
+    let wanted = auxiliary.to_ascii_lowercase();
+    let mut pending = vec![class.to_ascii_lowercase()];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some((sup, aux)) = classes.get(&name) else {
+            continue;
+        };
+        if aux.iter().any(|known| known == &wanted) {
+            return true;
+        }
+        if let Some(sup) = sup
+            && sup != &name
+        {
+            pending.push(sup.clone());
+        }
+    }
+    false
+}
+
 /// Both vocabularies, ready for [`crate::schema::Schema::extend`].
 #[must_use]
 pub fn vocabulary() -> String {
@@ -448,6 +498,21 @@ mod tests {
         assert!(
             category.starts_with("CN=Person,CN=Schema,CN=Configuration,"),
             "users belong to Person, which is what AD's schema says: {category}"
+        );
+    }
+
+    /// A security principal is recognised by the auxiliary class AD attaches to it.
+    #[test]
+    fn the_classes_that_carry_a_sid_say_so() {
+        for class in ["user", "computer", "group"] {
+            assert!(
+                has_auxiliary(class, "securityPrincipal"),
+                "{class} is a security principal in AD's schema"
+            );
+        }
+        assert!(
+            !has_auxiliary("organizationalUnit", "securityPrincipal"),
+            "an OU has no SID"
         );
     }
 

@@ -31,6 +31,14 @@ use thiserror::Error;
 #[derive(Clone, PartialEq, Eq)]
 pub struct Spec {
     dn: String,
+    /// The naming context the account lives under, which is what a derived `objectCategory` names.
+    base_dn: String,
+    /// The domain's SID, when this directory is a domain controller's.
+    ///
+    /// The first administrator AD creates is the built-in one, `RID 500`, and every client that
+    /// looks at an account's SID expects that number for it. `None` on a plain directory, where
+    /// there is no domain to number from.
+    domain_sid: Option<crate::sid::Sid>,
     password: Secret,
     /// The realm, when this directory is a domain controller's directory.
     ///
@@ -117,6 +125,8 @@ impl Spec {
 
         Ok(Self {
             dn,
+            base_dn: base.clone(),
+            domain_sid: None,
             password: Secret(password.to_string()),
             realm: None,
         })
@@ -137,9 +147,31 @@ impl Spec {
         self.realm.as_deref()
     }
 
+    /// Whether this administrator is an account of a domain rather than a person in a plain
+    /// directory - the difference that decides whether it is given a SID.
+    pub fn is_domain_account(&self) -> bool {
+        self.realm.is_some()
+    }
+
+    /// The SID this administrator is written with.
+    ///
+    /// Set by [`seed_with`] from the domain's own SID space: AD's first administrator is
+    /// `RID 500`, reserved rather than allocated, because a counter that handed that number to
+    /// somebody else would mint an account with the platform's built-in rights.
+    #[must_use]
+    pub fn with_domain_sid(mut self, sid: crate::sid::Sid) -> Self {
+        self.domain_sid = Some(sid);
+        self
+    }
+
     /// The DN the administrator will be created under.
     pub fn dn(&self) -> &str {
         &self.dn
+    }
+
+    /// The naming context the account lives under.
+    pub fn base_dn(&self) -> &str {
+        &self.base_dn
     }
 }
 
@@ -197,6 +229,10 @@ pub enum Error {
     PasswordEnvUnset { name: String },
     #[error("hashing the bootstrap password failed: {0}")]
     Hash(String),
+    #[error("no randomness to name the domain of the first administrator")]
+    NoRandomness,
+    #[error("the domain's own SID could not name the first administrator: {0}")]
+    NoSid(String),
     #[error(transparent)]
     Backend(#[from] BackendError),
 }
@@ -273,7 +309,26 @@ pub async fn seed_with(
         return Ok(Outcome::NotEmpty { entries });
     }
 
-    let entry = entry_for(spec, policy)?;
+    // The domain's built-in administrator is RID 500, and a store that owns a domain numbers this
+    // account from that domain rather than inventing a SID: a client comparing the first
+    // administrator against `S-1-5-21-<domain>-500` is comparing it against a number AD fixes.
+    let spec = match (spec.is_domain_account(), &spec.domain_sid) {
+        (true, None) => {
+            let mut entropy = [0u8; 16];
+            if getrandom::fill(&mut entropy).is_err() {
+                return Err(Error::NoRandomness);
+            }
+            match crate::sid::domain::Issuer::open(backend, entropy) {
+                Ok(issuer) => match issuer.reserved(crate::sid::reserved::ADMINISTRATOR) {
+                    Ok(sid) => spec.clone().with_domain_sid(sid),
+                    Err(err) => return Err(Error::NoSid(err.to_string())),
+                },
+                Err(err) => return Err(Error::NoSid(err.to_string())),
+            }
+        }
+        _ => spec.clone(),
+    };
+    let entry = entry_for(&spec, policy)?;
     backend
         .apply(&[EntryChange::Upsert { entry }])
         .await
@@ -370,6 +425,22 @@ fn entry_for(spec: &Spec, policy: &PasswordPolicy) -> Result<Entry, Error> {
         attributes = attributes.push(Attribute::single("cn", &value));
     }
 
+    // AD writes these into every object it creates, and its `top` class requires them, so the entry
+    // handed to the backend is the one its own schema accepts rather than one that becomes valid
+    // only on the way through the write funnel.
+    // Only for an account of a domain. A plain directory runs the core schema, which has no
+    // `objectCategory` to carry, and an administrator written with one is an entry that directory
+    // refuses to load - the shape AD requires is a shape only AD's vocabulary accepts.
+    let attributes = match &spec.domain_sid {
+        Some(sid) => {
+            let attributes = crate::ad_derived::synthesised(spec.dn(), &attributes, spec.base_dn());
+            attributes.push(sid.attribute("objectSid"))
+        }
+        None if spec.is_domain_account() => {
+            crate::ad_derived::synthesised(spec.dn(), &attributes, spec.base_dn())
+        }
+        None => attributes,
+    };
     Ok(Entry::new(spec.dn(), attributes))
 }
 
@@ -565,7 +636,12 @@ mod password_source_tests {
     fn a_domain_administrator_is_an_account_the_realm_can_find() {
         let spec = Spec::new(None, "dc=example,dc=com", "users", "admin-secret")
             .expect("spec")
-            .as_domain_account("example.com");
+            .as_domain_account("example.com")
+            // What `seed_with` does: the first administrator of a domain is the built-in one, and
+            // its SID is reserved out of the domain's space.
+            .with_domain_sid(
+                crate::sid::Sid::parse("S-1-5-21-1-2-3-500").expect("the built-in administrator"),
+            );
         let policy = crate::password::PasswordPolicy::default();
         let entry = entry_for(&spec, &policy).expect("entry");
 

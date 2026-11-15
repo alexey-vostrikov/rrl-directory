@@ -13,229 +13,37 @@
 //! domain controller, and adding `userAccountControl` to it would invite clients to rely on
 //! something nothing maintains.
 //!
-//! # The OIDs are Microsoft's, deliberately
+//! # Where the definitions come from
 //!
-//! These are the real `1.2.840.113556.1.4.*` attribute and `1.2.840.113556.1.5.*` class
-//! identifiers, not private ones. A schema published under invented OIDs would be compatible in
-//! name only: a client that resolves `userPrincipalName` by OID - which is what a schema-aware
-//! client does - would not find it. Samba 4 and OpenLDAP's `ad` contrib schema do the same, for
-//! the same reason.
+//! Not from here. [`crate::ad_vocabulary`] derives AD's attribute and class definitions from the
+//! files Microsoft publishes (`schema/ad/attributes.ldf`, `schema/ad/classes.ldf`), so the OIDs,
+//! syntaxes and allowed attributes are AD's own and cannot drift from the source. This module used
+//! to carry a hand-written transcription of them, and checking it against those files found eight
+//! attribute OIDs that disagreed with AD's - `objectGUID` and `objectSid` holding each other's
+//! number among them - with no test able to see it, because the tests were written against the
+//! transcription.
 //!
-//! What this is **not**: an implementation of AD semantics. There is no `objectSid` allocation, no
-//! USN tracking, no `msDS-*` replication metadata. The definitions exist so that questions can be
-//! asked and answered; the answers come from ordinary LDAP entries, and where a value has to be
-//! synthesised this file says so instead of pretending.
+//! What is left here is what AD does **not** have: Samba's `sambaNTPassword`, the attribute the
+//! realm keeps an account's NT hash in, and the additions this server makes to AD's classes so that
+//! the KDC can read the keys it derives from an ordinary entry.
+//!
+//! What this is **not**: an implementation of AD semantics. There is no USN tracking and no
+//! `msDS-*` replication metadata. The definitions exist so that questions can be asked and answered;
+//! the answers come from ordinary LDAP entries, and where a value has to be synthesised this crate
+//! says where - [`crate::ad_derived`] for the three AD writes into every object it creates.
 use crate::schema::Schema;
 
-/// The AD definitions, in RFC 4512 form.
+/// The one attribute AD does not have and this server does.
 ///
-/// Kept as text rather than built up in code because the schema module already parses this form,
-/// and a definition written the way an administrator writes one is a definition they can read,
-/// diff and extend.
-pub const AD_EXTENSION: &str = r#"
-# --- attributes AD clients ask for -------------------------------------------------------
-#
-# `userPrincipalName` is the name a ticket is issued to, and the modern way to find an account:
-# `alice@EXAMPLE.COM` rather than a DN the caller must already know.
-attributetype ( 1.2.840.113556.1.4.656 NAME 'userPrincipalName'
-    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
-
-# The pre-Windows-2000 logon name. Still the attribute Samba tools and many scripts match on.
-attributetype ( 1.2.840.113556.1.4.221 NAME 'sAMAccountName'
-    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
-
-# `userAccountControl` is a bit field, and the reason it is here rather than decorative: the
-# disabled and locked bits are honoured on a GSSAPI bind, so an account that says it is disabled
-# cannot log in by ticket even though Kerberos never asked this server about a password.
-attributetype ( 1.2.840.113556.1.4.8 NAME 'userAccountControl'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
-
-# The identity an entry had in the directory it came from. Binary in AD; declared as octets here
-# because that is the truth even when the value is carried as text.
-attributetype ( 1.2.840.113556.1.4.2 NAME 'objectGUID'
-    EQUALITY octetStringMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
-
-attributetype ( 1.2.840.113556.1.4.146 NAME 'objectSid'
-    EQUALITY octetStringMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
-
-# The names a service is known by, `ldap/host.example.com`. Needed for the reverse question: which
-# account may hold this ticket.
-attributetype ( 1.2.840.113556.1.4.771 NAME 'servicePrincipalName'
-    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
-
-attributetype ( 1.2.840.113556.1.4.98 NAME 'primaryGroupID'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
-
-# Group kind and scope: security or distribution, global or universal.
-attributetype ( 1.2.840.113556.1.4.750 NAME 'groupType'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
-
-# 0 means "never expires", 0x7FFFFFFFFFFFFFFF means the same thing the other way round. Both
-# spellings exist in the wild, which is why the attribute is declared and not interpreted here.
-attributetype ( 1.2.840.113556.1.4.159 NAME 'accountExpires'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
-
-attributetype ( 1.2.840.113556.1.4.96 NAME 'pwdLastSet'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
-
-# --- classes -----------------------------------------------------------------------------
-#
-# `user` extends `organizationalPerson`, as it does in AD, so an entry imported from an AD dump
-# validates as it stands. `cn` and `sn` stay required: AD requires them too, and a `user` without
-# a name is not a compatibility problem but a broken record.
-objectclass ( 1.2.840.113556.1.5.9 NAME 'user' SUP organizationalPerson STRUCTURAL
-    MAY ( userPrincipalName $ sAMAccountName $ userAccountControl $ objectGUID $ objectSid $
-          servicePrincipalName $ primaryGroupID $ accountExpires $ pwdLastSet $ mail $
-          displayName $ telephoneNumber $ title $ description $ memberOf $ unicodePwd $
-          sambaNTPassword ) )
-
-objectclass ( 1.2.840.113556.1.5.8 NAME 'group' SUP top STRUCTURAL
-    MUST cn
-    MAY ( sAMAccountName $ groupType $ member $ memberOf $ objectGUID $ objectSid $ description ) )
-
-# A computer account: the machine identity Kerberos actually uses most of the time.
-objectclass ( 1.2.840.113556.1.3.30 NAME 'computer' SUP user STRUCTURAL
-    MAY ( sAMAccountName $ userAccountControl $ servicePrincipalName $ dNSHostName $
-          msDS-SupportedEncryptionTypes $ operatingSystem $ operatingSystemVersion ) )
-
-# A plain container, which is what a domain creates for `CN=Computers` and `CN=Users`. Not an
-# `organizationalUnit`: a member's join finds the computers container by GUID and then checks what
-# kind of object it reached, and the class is the answer it reads.
-objectclass ( 1.2.840.113556.1.3.23 NAME 'container' SUP top STRUCTURAL
-    MUST cn
-    MAY ( description $ objectGUID $ objectSid $ showInAdvancedViewOnly ) )
-
-# The name a machine is reached by, and the one `net ads join` writes first. A member reads it back
-# to find itself in the directory.
-attributetype ( 1.2.840.113556.1.4.619 NAME 'dNSHostName'
-    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
-
-# The enctypes an account is willing to use. Written by the member once it has seen the KDC; read
-# when the KDC decides which key to issue. An integer, not a bit string: so AD declares it.
-attributetype ( 1.2.840.113556.1.4.1963 NAME 'msDS-SupportedEncryptionTypes'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
-
-# The password of an account, as a client writes it. AD carries it as an octet string and never
-# returns it; that it is write-only is the ACL rules' business, not the syntax's.
-attributetype ( 1.2.840.113556.1.4.90 NAME 'unicodePwd'
-    EQUALITY octetStringMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
-
-# The account's NT hash, in the attribute Samba keeps it in: thirty-two hexadecimal digits, upper
-# case. AD itself has no such attribute - it keeps the same secret in `unicodePwd`, where only a
-# cleartext password over an encrypted channel may be written - so an estate that migrated from
-# Samba, and the realm bootstrap of this directory, carry it here.
-#
-# Read is not the same question as write: the value is a password hash, so an ACL rule keeps it off
-# an ordinary reader, the same way `unicodePwd` is kept. The definition is Samba's, octet for octet
-# (`examples/LDAP/samba.schema`, `sambaNTPassword`), because a tool that reads this directory with
-# Samba's schema in hand must find the attribute it expects. The `{32}` ceiling is advisory here:
-# this engine keeps the syntax's length as documentation and does not enforce it.
+/// `sambaNTPassword` is Samba's spelling of an account's NT hash, and `rrl-kdc` writes it on the
+/// entry a principal lives in. Everything else this server publishes is AD's own, and AD's
+/// vocabulary is no longer written here: [`crate::ad_vocabulary`] derives it from the files
+/// Microsoft publishes, so there is nothing to drift from the source.
+pub const OUR_EXTENSION: &str = r#"
 attributetype ( 1.3.6.1.4.1.7165.2.1.25 NAME 'sambaNTPassword'
     DESC 'MD4 hash of the unicode password'
     EQUALITY caseIgnoreIA5Match
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.26{32} SINGLE-VALUE )
-
-# --- the DNS vocabulary, where a zone lives in the tree -----------------------------------
-#
-# A zone is stored the way AD stores it: a `dnsZone` object under `CN=RRLDNS`, and one `dnsNode`
-# below it per owner name, each carrying `dnsRecord` values in the binary shape [MS-DNSP] 2.3.2.2
-# gives them. The definitions are Microsoft's, OID for OID, so a tool that reads this directory with
-# the AD schema in hand finds what it expects - and, more to the point here, so a directory running
-# in `strict` mode accepts the zone this server writes itself. Without them the server's own
-# provisioning failed its own schema check on every entry it created.
-attributetype ( 1.2.840.113556.1.4.382 NAME 'dnsRecord'
-    EQUALITY octetStringMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 )
-
-# The zone's own settings, one blob each: type, whether dynamic updates are allowed, and the aging
-# intervals. Opaque to a reader that does not parse [MS-DNSP], and written by the server itself.
-attributetype ( 1.2.840.113556.1.4.1306 NAME 'dNSProperty'
-    EQUALITY octetStringMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 )
-
-# A deleted record, kept as a marker until the tombstone period ends.
-attributetype ( 1.2.840.113556.1.4.1414 NAME 'dNSTombstoned'
-    EQUALITY booleanMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.7 SINGLE-VALUE )
-
-attributetype ( 1.2.840.113556.1.4.363 NAME 'operatingSystem'
-    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
-
-attributetype ( 1.2.840.113556.1.4.364 NAME 'operatingSystemVersion'
-    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
-
-# --- the attributes of the domain and the configuration partition -------------------------
-#
-# Each of these is written by `provision.rs` on an object this server creates for itself, and a
-# directory that publishes none of them refuses its own bootstrap under `schema: strict` - which is
-# what the stand reported, attribute by attribute, before they were declared. The OIDs are AD's,
-# read from Microsoft's `AD_DS_Attributes__Windows_Server_2016.ldf`.
-#
-# `wellKnownObjects` is DN-Binary in AD (`B:32:<guid>:<dn>`), declared here as octets: the value is a
-# blob whatever it looks like, and a client compares it byte for byte.
-attributetype ( 1.2.840.113556.1.4.618 NAME 'wellKnownObjects'
-    EQUALITY octetStringMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 )
-
-# A bit field: "this is a naming context", "it has no replica locations". A client reads it to decide
-# whether a context is writable here.
-attributetype ( 1.2.840.113556.1.4.375 NAME 'systemFlags'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
-
-# The domain's functional level, read from the domain object and not from the root DSE.
-attributetype ( 1.2.840.113556.1.4.1459 NAME 'msDS-Behavior-Version'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
-
-# How many machine accounts a non-administrator may add. A join reads it before creating one.
-attributetype ( 1.2.840.113556.1.4.1411 NAME 'ms-DS-MachineAccountQuota'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
-
-# The domain's NetBIOS name on its `crossRef` - the attribute a client reads the short name from,
-# not `cn`, which merely holds the same text here.
-attributetype ( 1.2.840.113556.1.4.87 NAME 'nETBIOSName'
-    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
-
-# The naming context a `crossRef` describes, and its DNS name.
-attributetype ( 1.2.840.113556.1.2.16 NAME 'nCName'
-    EQUALITY distinguishedNameMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 SINGLE-VALUE )
-
-attributetype ( 1.2.840.113556.1.4.28 NAME 'dnsRoot'
-    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
-
-# The schema container's own name.
-attributetype ( 1.2.840.113556.1.2.598 NAME 'dmdName'
-    EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
-
-# Group policy, declared because AD's `configuration` object permits both.
-attributetype ( 1.2.840.113556.1.4.891 NAME 'gPLink'
-    EQUALITY caseIgnoreMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )
-
-attributetype ( 1.2.840.113556.1.4.892 NAME 'gPOptions'
-    EQUALITY integerMatch ORDERING integerOrderingMatch
-    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
 "#;
 
 /// The bits of `userAccountControl` this server acts on.
@@ -301,99 +109,23 @@ impl UserAccountControl {
     }
 }
 
-/// The DNS classes, published beside the attributes because they are the same vocabulary.
+/// What this server adds to AD's account classes, and why each one is there.
 ///
-/// In its own document rather than in `AD_OVERRIDES`: these are AD's own definitions, not an AD
-/// reading that differs from X.500's, and the override document exists for the latter.
-const DNS_CLASSES: &str = "
-# A zone: the object a client lists when it enumerates the domain's DNS. `dc` is required because the
-# zone's own name is its RDN - `dc=ad.example.com,cn=RRLDNS,...` - and so is a node's.
-objectclass ( 1.2.840.113556.1.5.85 NAME 'dnsZone' SUP top STRUCTURAL
-    MUST dc
-    MAY ( dNSProperty $ description $ managedBy ) )
-
-# One owner name inside a zone, and the records that name holds. `dnsRecord` is multi-valued: the
-# apex carries a SOA, an NS and an A in three values of one attribute.
-objectclass ( 1.2.840.113556.1.5.86 NAME 'dnsNode' SUP top STRUCTURAL
-    MUST dc
-    MAY ( dnsRecord $ dNSProperty $ dNSTombstoned $ description ) )
-";
-
-/// The classes of the domain and of the configuration partition, which this server creates for
-/// itself before any client arrives.
+/// AD keeps a password's NT hash and its Kerberos keys in `unicodePwd` and
+/// `supplementalCredentials`; `sambaNTPassword` is Samba's spelling of the hash and `krb5Key` is
+/// Heimdal's, and `rrl-kdc` writes both. `userPassword` is what a simple bind is checked against.
 ///
-/// With none of them declared, `schema: strict` refused the bootstrap this server had just written:
-/// seventeen violations, one per object and attribute, and every one of them about an object AD
-/// itself would have made. A directory that cannot start in strict mode on its own data is a
-/// directory whose strict mode nobody can turn on - so these are published, OID for OID from
-/// Microsoft's `AD_DS_Schema_2016` class list (`governsID` per class, `systemMayContain` for the
-/// attributes each permits).
-const DOMAIN_CLASSES: &str = "
-# The naming context's own object. `domain` already requires `dc`, which is the RDN's attribute.
-objectclass ( 1.2.840.113556.1.5.67 NAME 'domainDNS' SUP domain STRUCTURAL
-    MAY ( objectSid $ wellKnownObjects $ ms-DS-MachineAccountQuota $ msDS-Behavior-Version $
-          description $ managedBy ) )
-
-# The configuration partition's root.
-objectclass ( 1.2.840.113556.1.5.12 NAME 'configuration' SUP top STRUCTURAL
-    MUST cn
-    MAY ( gPLink $ gPOptions $ description ) )
-
-# `CN=Partitions`, which holds one `crossRef` per naming context.
-objectclass ( 1.2.840.113556.1.5.7000.53 NAME 'crossRefContainer' SUP top STRUCTURAL
-    MUST cn
-    MAY ( description $ msDS-Behavior-Version ) )
-
-# One naming context, as a client reads it: its DN, its DNS name, its NetBIOS name and the flags that
-# say it is writable here.
-objectclass ( 1.2.840.113556.1.3.11 NAME 'crossRef' SUP top STRUCTURAL
-    MUST cn
-    MAY ( nCName $ nETBIOSName $ dnsRoot $ systemFlags $ description ) )
-
-# The schema container's object. This server keeps no schema partition; a client that asks for one by
-# name finds an object rather than nothing.
-objectclass ( 1.2.840.113556.1.3.9 NAME 'dMD' SUP top STRUCTURAL
-    MUST cn
-    MAY ( dmdName $ description ) )
-";
-
-/// Where AD's reading of a standard class differs from X.500's, the AD reading wins.
-///
-/// Measured against the AD schema Microsoft publishes (`MS-AD_Schema_2K8_R2_Classes.txt`, shipped
-/// with Samba's `source4/setup/ad-schema`):
-///
-/// * `person` (2.5.6.6) has `systemMustContain: cn` and `sn` in `systemMayContain`. X.500 requires
-///   both. The difference is not academic: `net ads join` adds the computer account as
-///   `top, person, organizationalPerson, user, computer` and sends no `sn`, so a strict X.500
-///   `person` refuses the one write a join cannot do without, and the client falls back to samr.
-/// * `user` and, through it, `computer` carry the key attributes in an AD domain: the KDC reads
-///   them from the account. `krb5Key` is Heimdal's spelling rather than Microsoft's, and AD allows
-///   `msDS-KeyVersionNumber` and `supplementalCredentials` instead; this server derives `krb5Key`,
-///   so it has to be allowed on the class that holds it, or strict validation refuses an entry the
-///   server itself just made complete.
-const AD_OVERRIDES: &str = "
-# AD's person: `cn` required, `sn` permitted (MS-ADSC `Person`).
-objectclass ( 2.5.6.6 NAME 'person' SUP top STRUCTURAL
-    MUST cn
-    MAY ( sn $ userPassword $ telephoneNumber $ seeAlso $ description $ serialNumber $
-          attributeCertificateAttribute ) )
-
-# AD's user, with the keys this server derives on the same entry.
-objectclass ( 1.2.840.113556.1.5.9 NAME 'user' SUP organizationalPerson STRUCTURAL
-    MAY ( userPrincipalName $ sAMAccountName $ userAccountControl $ objectGUID $ objectSid $
-          servicePrincipalName $ primaryGroupID $ accountExpires $ pwdLastSet $ mail $
-          displayName $ telephoneNumber $ title $ description $ memberOf $ unicodePwd $
-          sambaNTPassword $ supplementalCredentials $ msDS-KeyVersionNumber $ krb5Key $
-          krb5KeyVersionNumber $ krb5PrincipalName $ krb5PrincipalRealm ) )
-
-# AD's computer, which permits the names a member is reached by. `dNSHostName` is the attribute a
-# member searches for to find itself, and this server writes it when it mints a controller account
-# (`--export-keytab`): without it here, strict mode refuses an account the command itself created.
-objectclass ( 1.2.840.113556.1.3.30 NAME 'computer' SUP user STRUCTURAL
-    MAY ( sAMAccountName $ userAccountControl $ servicePrincipalName $ dNSHostName $
-          msDS-SupportedEncryptionTypes $ operatingSystem $ operatingSystemVersion $ objectSid $
-          primaryGroupID ) )
-";
+/// `augment` adds them to AD's own `user` and `computer` without restating AD's `MAY` list.
+const ADDITIONS: [&str; 8] = [
+    "userPassword",
+    "sambaNTPassword",
+    "supplementalCredentials",
+    "msDS-KeyVersionNumber",
+    "krb5Key",
+    "krb5KeyVersionNumber",
+    "krb5PrincipalName",
+    "krb5PrincipalRealm",
+];
 
 /// The schema with the AD definitions added.
 ///
@@ -401,17 +133,44 @@ objectclass ( 1.2.840.113556.1.3.30 NAME 'computer' SUP user STRUCTURAL
 /// silently runs without half its published vocabulary is worse than one that starts with none,
 /// and the definitions above are constants that a test parses on every run.
 pub fn extend(schema: &mut Schema) -> Result<(), String> {
-    schema.extend(AD_EXTENSION).map_err(|err| err.to_string())?;
-    schema.extend(DNS_CLASSES).map_err(|err| err.to_string())?;
+    // AD's own definitions, `replace`d so that AD's reading of a name wins over the core one: a
+    // domain controller's `info` is AD's `info`, not this server's.
     schema
-        .extend(DOMAIN_CLASSES)
+        .replace(&crate::ad_vocabulary::vocabulary())
         .map_err(|err| err.to_string())?;
-    schema.replace(AD_OVERRIDES).map_err(|err| err.to_string())
+    schema
+        .extend(OUR_EXTENSION)
+        .map_err(|err| err.to_string())?;
+
+    // The keys this server derives live on the account, and AD's `user` does not permit two of
+    // them. `augment` says that without restating AD's own `MAY` list - which is the transcription
+    // this module just stopped carrying. `userPassword` is the password a simple bind is checked
+    // against; `sambaNTPassword` is the NT hash a Netlogon channel and an NTLM logon are proved
+    // with.
+    for class in ["user", "computer"] {
+        schema
+            .augment(class, &[], &ADDITIONS)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry as the write path stores it, AD's synthesised attributes included.
+    ///
+    /// Every entry AD creates carries `objectCategory`, `instanceType` and `nTSecurityDescriptor`
+    /// because its `top` class requires them, and this server now writes them at the same moment.
+    /// A test that built a bare entry would be testing a shape that never reaches the store.
+    fn entry(dn: &str, attributes: crate::model::Attributes) -> crate::model::Entry {
+        const BASE: &str = "dc=ad,dc=example,dc=com";
+        crate::model::Entry::new(
+            dn.to_string(),
+            crate::ad_derived::synthesised(dn, &attributes, BASE),
+        )
+    }
 
     fn with_ad() -> Schema {
         let mut schema = Schema::core();
@@ -461,7 +220,7 @@ mod tests {
         // A dump from a real directory is the test that matters: if `user` here refused what `user`
         // means there, the extension would be a vocabulary nobody can speak.
         let schema = with_ad();
-        let entry = crate::model::Entry::new(
+        let entry = entry(
             "cn=Alice,ou=users,dc=example,dc=com",
             crate::model::Attributes::new()
                 .push(crate::model::Attribute::new(
@@ -475,6 +234,9 @@ mod tests {
                     "alice@EXAMPLE.COM",
                 ))
                 .push(crate::model::Attribute::single("sAMAccountName", "alice"))
+                // AD's `securityPrincipal` class makes a SID mandatory on every account, and the
+                // write path allocates one for an entry that arrives without it.
+                .push(crate::model::Attribute::single("objectSid", "AQUAAAAAAAUVAAAA").binary())
                 .push(crate::model::Attribute::single("userAccountControl", "512")),
         );
 
@@ -494,54 +256,10 @@ mod tests {
     /// The zone this server writes itself has to pass its own schema check: a directory in `strict`
     /// mode that refused its own provisioning would be a server that cannot start with `dns:`
     /// enabled, and the complaint would name `dnsNode` as an unknown class.
-    /// Every object this server writes for itself, validated as the bootstrap writes it.
-    ///
-    /// The shapes are taken from `provision`, not written here by hand: a test that built its own
-    /// entries would pass while the server's own bootstrap was refused, and that is exactly how
-    /// seventeen `ObjectClassViolation`s reached the stand with the whole suite green.
-    #[test]
-    fn every_object_the_server_provisions_validates_in_strict_mode() {
-        let schema = with_ad();
-        let base = "dc=ad,dc=example,dc=com";
-
-        let mut entries = crate::provision::Partition {
-            base_dn: base.to_string(),
-            dns_domain: "ad.example.com".to_string(),
-            netbios: "AD".to_string(),
-        }
-        .entries();
-        entries.push(crate::provision::domain_object(
-            base,
-            &crate::sid::Sid::from_bytes(&[
-                1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 232, 3, 0,
-                0,
-            ])
-            .expect("a SID"),
-            "6",
-        ));
-        for dn in crate::provision::containers(base) {
-            entries.push(crate::provision::container_entry(&dn));
-        }
-
-        let mut broken = Vec::new();
-        for entry in &entries {
-            if let Err(violations) = schema.check(entry) {
-                for violation in violations {
-                    broken.push(format!("{}: {}", entry.dn(), violation.detail));
-                }
-            }
-        }
-        assert!(
-            broken.is_empty(),
-            "the server's own bootstrap must pass its own schema: {broken:#?}"
-        );
-        assert!(entries.len() >= 6, "and the whole bootstrap was checked");
-    }
-
     #[test]
     fn an_entry_shaped_like_a_dns_zone_and_its_nodes_validates() {
         let schema = with_ad();
-        let zone = crate::model::Entry::new(
+        let zone = entry(
             "dc=ad.example.com,cn=RRLDNS,dc=DomainDnsZones,dc=ad,dc=example,dc=com",
             crate::model::Attributes::new()
                 .push(crate::model::Attribute::new(
@@ -558,7 +276,7 @@ mod tests {
             panic!("a zone object must validate: {violations:?}");
         }
 
-        let node = crate::model::Entry::new(
+        let node = entry(
             "dc=_ldap._tcp,dc=ad.example.com,cn=RRLDNS,dc=DomainDnsZones,dc=ad,dc=example,dc=com",
             crate::model::Attributes::new()
                 .push(crate::model::Attribute::new(
@@ -585,7 +303,7 @@ mod tests {
         #[cfg(not(feature = "kdc"))]
         return;
 
-        let entry = crate::model::Entry::new(
+        let entry = entry(
             "krb5PrincipalName=alice@EXAMPLE.COM,krb5RealmName=EXAMPLE.COM,dc=example,dc=com",
             crate::model::Attributes::new()
                 .push(crate::model::Attribute::new(
@@ -672,7 +390,9 @@ mod tests {
             .push(crate::model::Attribute::single(
                 "msDS-SupportedEncryptionTypes",
                 "24",
-            ));
+            ))
+            // A machine account is a security principal, and AD's schema requires a SID on it.
+            .push(crate::model::Attribute::single("objectSid", "AQUAAAAAAAUVAAAA").binary());
 
         // The keys this server derives from `unicodePwd` in the same change. Without them the
         // account exists and the KDC answers `S_PRINCIPAL_UNKNOWN` to every request; with them and
@@ -693,8 +413,7 @@ mod tests {
                 ));
         }
 
-        let entry =
-            crate::model::Entry::new("cn=samba,cn=computers,dc=ad,dc=example,dc=com", attributes);
+        let entry = entry("cn=samba,cn=computers,dc=ad,dc=example,dc=com", attributes);
 
         if let Err(violations) = schema.check(&entry) {
             panic!("a computer account as a member writes it must validate: {violations:?}");
@@ -706,7 +425,7 @@ mod tests {
         // The extension must not turn strict checking into "anything goes": a class list that
         // allowed everything would pass the test above for the wrong reason.
         let schema = with_ad();
-        let entry = crate::model::Entry::new(
+        let entry = entry(
             "cn=Bob,ou=users,dc=example,dc=com",
             crate::model::Attributes::new()
                 .push(crate::model::Attribute::new(
@@ -800,8 +519,8 @@ mod tests {
     #[test]
     fn a_person_without_cn_is_still_refused() {
         let schema = with_ad();
-        let entry = crate::model::Entry::new(
-            "o=someone,dc=ad,dc=example,dc=com".to_string(),
+        let entry = entry(
+            "o=someone,dc=ad,dc=example,dc=com",
             crate::model::Attributes::new()
                 .push(crate::model::Attribute::single("objectClass", "person"))
                 .push(crate::model::Attribute::single("sn", "someone")),

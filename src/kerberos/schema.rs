@@ -136,8 +136,11 @@ objectclass ( 1.3.6.1.4.1.5322.10.2.2 NAME 'krb5KDCEntry' SUP krb5Principal AUXI
 
 /// Adds the Kerberos definitions to `schema`.
 pub fn extend(schema: &mut Schema) -> Result<(), String> {
+    // `extend_missing`, not `extend`: AD's vocabulary defines `msDS-KeyVersionNumber` and
+    // `msDS-SupportedEncryptionTypes` too, and a domain controller loads both. The name that is
+    // already there keeps its definition - AD's - and the realm's classes still refer to it.
     schema
-        .extend(KERBEROS_EXTENSION)
+        .extend_missing(KERBEROS_EXTENSION)
         .map_err(|err| err.to_string())
 }
 

@@ -441,6 +441,47 @@ impl Schema {
         self.insert_class(definition)
     }
 
+    /// Adds the definitions in `definitions` that this schema does not already have.
+    ///
+    /// The counterpart of [`Self::extend`] for a vocabulary that is an **addition** to another one:
+    /// the realm's definitions name `msDS-KeyVersionNumber`, which AD's vocabulary also defines, and
+    /// loading both used to fail with `DuplicateName`. Whoever has the name keeps it - and on a
+    /// domain controller that is AD, because a client resolving the attribute by name has to get
+    /// AD's reading of it, not a second document's.
+    pub fn extend_missing(&mut self, definitions: &str) -> Result<(), SchemaError> {
+        for definition in split_definitions(definitions)? {
+            let tokens = tokenize(&definition)?;
+            match tokens.first().map(String::as_str) {
+                Some("attributetype") | Some("attributeType") => {
+                    let parsed = parse_attribute_type(&tokens)?;
+                    if parsed
+                        .names
+                        .iter()
+                        .any(|name| self.attribute(name).is_some())
+                    {
+                        continue;
+                    }
+                    self.insert_attribute(parsed)?;
+                }
+                Some("objectclass") | Some("objectClass") => {
+                    let parsed = parse_object_class(&tokens)?;
+                    if parsed.names.iter().any(|name| self.class(name).is_some()) {
+                        continue;
+                    }
+                    self.insert_class(parsed)?;
+                }
+                Some(other) => {
+                    return Err(SchemaError::UnknownKeyword {
+                        keyword: other.to_string(),
+                        kind: "definition",
+                    });
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn replace(&mut self, definitions: &str) -> Result<(), SchemaError> {
         for definition in split_definitions(definitions)? {
             let tokens = tokenize(&definition)?;
@@ -745,6 +786,12 @@ impl Schema {
             // out of abstract classes alone, which the structural count catches.
             match self.allowed_attributes(class_name) {
                 Some((must, may)) => {
+                    // A `MUST` attribute is also a *permitted* one: RFC 4512 §4.1.1 makes the
+                    // allowed set the union of the class's own and its superiors' `MUST` and `MAY`,
+                    // and an entry carrying a required attribute was being told it was not allowed
+                    // by any class. It never showed before AD's vocabulary, where `top` requires
+                    // `objectClass` - which every entry has and which no class lists in `MAY`.
+                    permitted.extend(must.iter().cloned());
                     required.extend(must);
                     permitted.extend(may);
                 }
@@ -782,6 +829,12 @@ impl Schema {
 
         for name in &required {
             if rdn_attribute.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            // The attributes the directory writes itself are not the writer's to supply: AD's
+            // `top` requires `objectCategory`, `instanceType` and `nTSecurityDescriptor`, and a
+            // store whose entries predate this server writing them is not made wrong by that.
+            if crate::ad_derived::is_maintained(name) {
                 continue;
             }
             if entry.attributes().get(name).is_none() {

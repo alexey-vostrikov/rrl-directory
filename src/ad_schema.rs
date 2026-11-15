@@ -96,7 +96,8 @@ attributetype ( 1.2.840.113556.1.4.96 NAME 'pwdLastSet'
 objectclass ( 1.2.840.113556.1.5.9 NAME 'user' SUP organizationalPerson STRUCTURAL
     MAY ( userPrincipalName $ sAMAccountName $ userAccountControl $ objectGUID $ objectSid $
           servicePrincipalName $ primaryGroupID $ accountExpires $ pwdLastSet $ mail $
-          displayName $ telephoneNumber $ title $ description $ memberOf $ unicodePwd ) )
+          displayName $ telephoneNumber $ title $ description $ memberOf $ unicodePwd $
+          sambaNTPassword ) )
 
 objectclass ( 1.2.840.113556.1.5.8 NAME 'group' SUP top STRUCTURAL
     MUST cn
@@ -131,6 +132,21 @@ attributetype ( 1.2.840.113556.1.4.1963 NAME 'msDS-SupportedEncryptionTypes'
 attributetype ( 1.2.840.113556.1.4.90 NAME 'unicodePwd'
     EQUALITY octetStringMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
+
+# The account's NT hash, in the attribute Samba keeps it in: thirty-two hexadecimal digits, upper
+# case. AD itself has no such attribute - it keeps the same secret in `unicodePwd`, where only a
+# cleartext password over an encrypted channel may be written - so an estate that migrated from
+# Samba, and the realm bootstrap of this directory, carry it here.
+#
+# Read is not the same question as write: the value is a password hash, so an ACL rule keeps it off
+# an ordinary reader, the same way `unicodePwd` is kept. The definition is Samba's, octet for octet
+# (`examples/LDAP/samba.schema`, `sambaNTPassword`), because a tool that reads this directory with
+# Samba's schema in hand must find the attribute it expects. The `{32}` ceiling is advisory here:
+# this engine keeps the syntax's length as documentation and does not enforce it.
+attributetype ( 1.3.6.1.4.1.7165.2.1.25 NAME 'sambaNTPassword'
+    DESC 'MD4 hash of the unicode password'
+    EQUALITY caseIgnoreIA5Match
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.26{32} SINGLE-VALUE )
 
 attributetype ( 1.2.840.113556.1.4.373 NAME 'operatingSystem'
     EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
@@ -230,8 +246,8 @@ objectclass ( 1.2.840.113556.1.5.9 NAME 'user' SUP organizationalPerson STRUCTUR
     MAY ( userPrincipalName $ sAMAccountName $ userAccountControl $ objectGUID $ objectSid $
           servicePrincipalName $ primaryGroupID $ accountExpires $ pwdLastSet $ mail $
           displayName $ telephoneNumber $ title $ description $ memberOf $ unicodePwd $
-          supplementalCredentials $ msDS-KeyVersionNumber $ krb5Key $ krb5KeyVersionNumber $
-          krb5PrincipalName $ krb5PrincipalRealm ) )
+          sambaNTPassword $ supplementalCredentials $ msDS-KeyVersionNumber $ krb5Key $
+          krb5KeyVersionNumber $ krb5PrincipalName $ krb5PrincipalRealm ) )
 ";
 
 /// The schema with the AD definitions added.
@@ -273,6 +289,7 @@ mod tests {
             "dnshostname",
             "msds-supportedencryptiontypes",
             "unicodepwd",
+            "sambantpassword",
         ] {
             assert!(
                 schema.attribute(name).is_some(),
@@ -314,6 +331,58 @@ mod tests {
 
         if let Err(violations) = schema.check(&entry) {
             panic!("an AD-shaped user must validate: {violations:?}");
+        }
+    }
+
+    /// The entry a realm bootstrap writes: Heimdal's principal classes, the Samba attribute the
+    /// NT hash goes into, and no `user` class at all.
+    ///
+    /// This is the shape that made seven `kdc_daemon` tests fail at once when `rrl-kdc` started
+    /// writing `sambaNTPassword`: the attribute was defined by neither vocabulary, and the
+    /// violation named the attribute rather than the class that should have permitted it. The
+    /// bootstrap's entry is a principal, so it is `krb5Principal`'s `MAY` list that has to carry
+    /// the name - not `user`'s, which nothing in that path adds.
+    #[test]
+    fn an_entry_shaped_like_a_realm_principal_carrying_an_nt_hash_validates() {
+        #[allow(unused_mut)]
+        let mut schema = with_ad();
+        #[cfg(feature = "kdc")]
+        crate::kerberos::schema::extend(&mut schema).expect("the realm vocabulary parses");
+        #[cfg(not(feature = "kdc"))]
+        return;
+
+        let entry = crate::model::Entry::new(
+            "krb5PrincipalName=alice@EXAMPLE.COM,krb5RealmName=EXAMPLE.COM,dc=example,dc=com",
+            crate::model::Attributes::new()
+                .push(crate::model::Attribute::new(
+                    "objectClass",
+                    vec![
+                        "top".to_string(),
+                        "krb5Principal".to_string(),
+                        "krb5KDCEntry".to_string(),
+                    ],
+                ))
+                .push(crate::model::Attribute::single(
+                    "krb5PrincipalName",
+                    "alice@EXAMPLE.COM",
+                ))
+                .push(crate::model::Attribute::single(
+                    "krb5PrincipalRealm",
+                    "EXAMPLE.COM",
+                ))
+                .push(crate::model::Attribute::single("krb5KeyVersionNumber", "1"))
+                .push(crate::model::Attribute::single("krb5KDCFlags", "12"))
+                // The value Samba writes: MD4 of the UTF-16LE password, as thirty-two upper-case
+                // hexadecimal digits. The exact digest does not matter to the schema, the shape does.
+                .push(crate::model::Attribute::single(
+                    "sambaNTPassword",
+                    "8846F7EAEE8FB117AD06BDD830B7586C",
+                )),
+        );
+
+        if let Err(violations) = schema.check(&entry) {
+            let reported: Vec<_> = violations.iter().map(|v| format!("{v:?}")).collect();
+            panic!("a principal carrying an NT hash must validate: {reported:?}");
         }
     }
 

@@ -110,6 +110,12 @@ attributetype ( 1.2.840.113556.1.4.750.1 NAME 'supplementalCredentials'
 
 # --- classes -------------------------------------------------------------------------------
 #
+# `sambaNTPassword` is declared by the AD vocabulary, beside `unicodePwd` it duplicates, and named
+# here because this is the class the KDC writes it on: `rust-heimdal-kdc` keeps an account's NT hash
+# in Samba's attribute, and a principal entry it writes is `krb5Principal`, not `user`. A class that
+# names an attribute another document defines is the normal shape, and both vocabularies are loaded
+# together wherever a realm exists.
+#
 # Structural, where Heimdal has it auxiliary: see the module note. `MUST` follows the DN this
 # server builds for a principal - a name and a realm - so an entry that is in the realm by its
 # naming is also valid by its attributes.
@@ -118,7 +124,8 @@ objectclass ( 1.3.6.1.4.1.5322.10.2.1 NAME 'krb5Principal' SUP top STRUCTURAL
     MAY ( krb5RealmName $ krb5Key $ krb5KeyVersionNumber $ krb5KDCFlags $ krb5EncryptionType $
           krb5ValidStart $ krb5ValidEnd $ krb5PasswordEnd $ krb5MaxLife $ krb5MaxRenew $
           krb5ExtendedAttributes $ msDS-KeyVersionNumber $ msDS-SupportedEncryptionTypes $
-          supplementalCredentials $ userAccountControl $ servicePrincipalName ) )
+          supplementalCredentials $ userAccountControl $ servicePrincipalName $
+          sambaNTPassword ) )
 
 # The KDC's own view of a principal: the flags and the keys. Auxiliary, because it adds to a
 # principal rather than being a kind of object.

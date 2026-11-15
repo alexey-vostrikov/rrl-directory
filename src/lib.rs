@@ -15,6 +15,7 @@
 
 pub mod acl;
 pub mod ad_schema;
+pub mod ad_vocabulary;
 pub mod backend;
 pub mod bootstrap;
 pub mod catalog;

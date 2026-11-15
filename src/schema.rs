@@ -406,12 +406,32 @@ impl Schema {
             match tokens.first().map(String::as_str) {
                 Some("attributetype") | Some("attributeType") => {
                     let parsed = parse_attribute_type(&tokens)?;
-                    self.attributes.retain(|_, kept| kept.oid != parsed.oid);
+                    // By OID **and by name**: AD's `info` is not the same attribute as this
+                    // server's `info` (different OIDs, different syntax), and keeping both makes
+                    // every later lookup on the name ambiguous - which is `DuplicateName`, raised
+                    // at load. A replacement that leaves the name behind is not a replacement.
+                    self.attributes.retain(|_, kept| {
+                        kept.oid != parsed.oid
+                            && !kept.names.iter().any(|name| {
+                                parsed
+                                    .names
+                                    .iter()
+                                    .any(|new| new.eq_ignore_ascii_case(name))
+                            })
+                    });
                     self.insert_attribute(parsed)?;
                 }
                 Some("objectclass") | Some("objectClass") => {
                     let parsed = parse_object_class(&tokens)?;
-                    self.classes.retain(|_, kept| kept.oid != parsed.oid);
+                    self.classes.retain(|_, kept| {
+                        kept.oid != parsed.oid
+                            && !kept.names.iter().any(|name| {
+                                parsed
+                                    .names
+                                    .iter()
+                                    .any(|new| new.eq_ignore_ascii_case(name))
+                            })
+                    });
                     self.insert_class(parsed)?;
                 }
                 Some(other) => {

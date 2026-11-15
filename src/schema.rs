@@ -339,6 +339,8 @@ pub enum SchemaError {
     UnknownSuperior(String),
     #[error("object class '{0}' has no 'sup' chain ending at 'top'")]
     BrokenClassChain(String),
+    #[error("augmenting '{0}', which this schema does not define")]
+    UnknownObjectClass(String),
     #[error(
         "the definition starting on line {line} is never closed: its parentheses are still open \
          at the end of the file ('{text}')"
@@ -400,6 +402,45 @@ impl Schema {
     /// Everything the old definition was reachable by is dropped before the new one is inserted,
     /// including names the new definition no longer declares: an alias left behind would resolve
     /// to a definition that is no longer in force.
+    /// Adds `may` (and `must`) to an existing class, without redefining it.
+    ///
+    /// The counterpart of [`Self::replace`] for an addition rather than a correction: AD's `user`
+    /// is AD's, and this server derives `krb5Key` on the same entry because the KDC reads it there.
+    /// Writing the class out again to add four attributes would be a transcription of AD's own
+    /// `MAY` list, and that is the thing this repository just stopped doing.
+    ///
+    /// Unknown class: an error, because an augmentation that silently applies to nothing is a schema
+    /// that says one thing and enforces another.
+    pub fn augment(&mut self, class: &str, must: &[&str], may: &[&str]) -> Result<(), SchemaError> {
+        let Some(definition) = self.class(class) else {
+            return Err(SchemaError::UnknownObjectClass(class.to_string()));
+        };
+        let mut definition = definition.clone();
+        for attribute in must {
+            if !definition
+                .must
+                .iter()
+                .any(|kept| kept.eq_ignore_ascii_case(attribute))
+            {
+                definition.must.push((*attribute).to_string());
+            }
+        }
+        for attribute in may {
+            if !definition
+                .may
+                .iter()
+                .any(|kept| kept.eq_ignore_ascii_case(attribute))
+            {
+                definition.may.push((*attribute).to_string());
+            }
+        }
+        // `insert_class` refuses a name it already has; the old definition goes first, and it is the
+        // same OID, so nothing else in the schema moves.
+        let oid = definition.oid.clone();
+        self.classes.retain(|_, kept| kept.oid != oid);
+        self.insert_class(definition)
+    }
+
     pub fn replace(&mut self, definitions: &str) -> Result<(), SchemaError> {
         for definition in split_definitions(definitions)? {
             let tokens = tokenize(&definition)?;
@@ -1665,6 +1706,29 @@ attributetype ( 2.5.4.41 NAME 'name'
 
 #[cfg(test)]
 mod source_tests {
+    /// `augment` adds to a class without restating it - and refuses a class it does not have.
+    ///
+    /// The shape AD's own vocabulary needs: `user` is AD's, and this server derives `krb5Key` on the
+    /// same entry because the KDC reads it there. Writing the class out again to add four attributes
+    /// would be a transcription of AD's `MAY` list, which is what this repository stopped doing.
+    #[test]
+    fn augment_adds_to_a_class_without_redefining_it() {
+        let mut schema = Schema::core();
+        // `person` is in the core schema; `user` is not - it arrives with AD's vocabulary, which is
+        // where the augmentation is used.
+        schema
+            .augment("person", &[], &["description"])
+            .expect("the core schema has a `person`");
+        let (_, may) = schema
+            .allowed_attributes("person")
+            .expect("the class is known");
+        assert!(may.contains("description"));
+        assert!(
+            schema.augment("nosuchclass", &[], &[]).is_err(),
+            "an augmentation that applies to nothing must not pass silently"
+        );
+    }
+
     /// A class that attaches an auxiliary one permits what that class permits.
     ///
     /// This is AD's `systemAuxiliaryClass`, and the reason it is in the engine rather than in the

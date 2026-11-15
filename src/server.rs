@@ -225,7 +225,7 @@ pub async fn serve_connection_as(
         // operation already being answered is finished before the connection is
         // closed, which is what "graceful" has to mean for a client mid-search.
         let bytes = match tokio::select! {
-            read = codec::read_message_with(&mut stream, session.wrap()) => read,
+            read = codec::read_from(&mut stream, &mut session) => read,
             // A change to push down one of the persistent searches. `Lagged` means this connection
             // fell behind the buffer: the honest recovery is to let it re-read, which the client
             // does when its cookie no longer matches, so the subscription is dropped rather than
@@ -239,7 +239,7 @@ pub async fn serve_connection_as(
                             for message in
                                 subscription.messages_for(&notice, &directory, &policy)
                             {
-                                if codec::write_message_with(&mut stream, &message, session.wrap()).await.is_err() {
+                                if codec::write_to(&mut stream, &message, &mut session).await.is_err() {
                                     return Ok(Hangup::PeerClosed);
                                 }
                             }
@@ -356,7 +356,7 @@ pub async fn serve_connection_as(
                 }
 
                 for message in messages {
-                    codec::write_message_with(&mut stream, &message, session.wrap()).await?;
+                    codec::write_to(&mut stream, &message, &mut session).await?;
                 }
             }
             Action::Persist(action) => {
@@ -388,9 +388,7 @@ pub async fn serve_connection_as(
                 }
 
                 match outcome {
-                    Ok(_) => {
-                        codec::write_message_with(&mut stream, &success, session.wrap()).await?
-                    }
+                    Ok(_) => codec::write_to(&mut stream, &success, &mut session).await?,
                     Err(err) => {
                         eprintln!(
                             "{}",
@@ -401,7 +399,7 @@ pub async fn serve_connection_as(
                             rasn_ldap::ResultCode::UnwillingToPerform,
                             &format!("error updating backend data: {err}"),
                         );
-                        codec::write_message_with(&mut stream, &response, session.wrap()).await?;
+                        codec::write_to(&mut stream, &response, &mut session).await?;
                     }
                 }
             }
@@ -410,7 +408,7 @@ pub async fn serve_connection_as(
                 subscription,
             } => {
                 for message in &messages {
-                    codec::write_message_with(&mut stream, message, session.wrap()).await?;
+                    codec::write_to(&mut stream, message, &mut session).await?;
                 }
                 // Registered before the loop continues, so a change that lands while the answer is
                 // still being written is delivered rather than lost between the refresh and the
@@ -419,7 +417,7 @@ pub async fn serve_connection_as(
             }
             Action::PersistAfterReply { messages, changes } => {
                 for message in &messages {
-                    codec::write_message_with(&mut stream, message, session.wrap()).await?;
+                    codec::write_to(&mut stream, message, &mut session).await?;
                 }
                 // The reply is already out and it is correct; a failure here is an
                 // operational problem to log, not an error to report to this client.
@@ -447,12 +445,12 @@ pub async fn serve_connection_as(
                     &adopted,
                 );
                 let _ = (generation, response);
-                codec::write_message_with(&mut stream, &answer, session.wrap()).await?;
+                codec::write_to(&mut stream, &answer, &mut session).await?;
             }
             Action::Silent => {}
             Action::StartTls(message_id) => {
                 if acceptor.is_none() {
-                    codec::write_message_with(
+                    codec::write_to(
                         &mut stream,
                         &crate::ldap::responses::extended_response(
                             message_id,
@@ -460,13 +458,13 @@ pub async fn serve_connection_as(
                             "StartTLS is not configured on this server",
                             None,
                         ),
-                        session.wrap(),
+                        &mut session,
                     )
                     .await?;
                     continue;
                 }
 
-                codec::write_message_with(
+                codec::write_to(
                     &mut stream,
                     &crate::ldap::responses::extended_response(
                         message_id,
@@ -474,7 +472,7 @@ pub async fn serve_connection_as(
                         "",
                         Some(crate::ldap::starttls::STARTTLS_OID),
                     ),
-                    session.wrap(),
+                    &mut session,
                 )
                 .await?;
 

@@ -500,7 +500,8 @@ const ENGLISH: &[(&str, &str)] = &[
     ),
     (
         "error.malformed",
-        "client {peer} sent a malformed message, connection closed",
+        "client {peer} sent a message this server cannot decode ({detail}); the opening octets \
+         were {head}",
     ),
     ("error.client", "client {peer}: {detail}"),
     (

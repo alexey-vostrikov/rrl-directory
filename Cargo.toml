@@ -40,7 +40,13 @@ hickory-server = { version = "0.26.3", default-features = false, optional = true
 # `src/index_file.rs`. Everything else - protocol parsing, TLS, HTTP, storage - is safe code.
 memmap2 = "0.9"
 md-5 = "0.11.0"
+# HMAC-MD5 is the NTLM signature ([MS-NLMP] 3.4.4.2), and the same crate the tests already used.
+hmac = "0.13.0"
 pbkdf2 = "0.13.0"
+# The NTLM security layer seals with RC4 ([MS-NLMP] 3.4.4.2), and this is the same crate the SMB
+# acceptor already pulls in, so the graph gains no new code: `rc4` is RustCrypto's, safe Rust, and
+# a range rather than an exact version for the reason every dependency here is.
+rc4 = "0.2"
 rasn = "0.30.0"
 rasn-ldap = "0.30.0"
 redb = "4.4.0"
@@ -130,9 +136,6 @@ dns = ["dep:hickory-server"]
 [dev-dependencies]
 rrl-kdc = { git = "https://github.com/alexey-vostrikov/rrl-kdc", branch = "main" }
 futures = "0.3.34"
-# The NTLM test builds a client's answer by hand, and HMAC-MD5 is the one primitive it needs;
-# hand-rolling it in a test would mean the test and the server could agree on a wrong answer.
-hmac = "0.13.0"
 rcgen = "0.14.10"
 serde_json = "1.0.154"
 tempfile = "3.27.0"

@@ -47,7 +47,7 @@ error.password_upgrade: "обновление хеша пароля для '{dn}
 error.accept: "ошибка при приёме соединения: {detail}"
 error.tls_handshake: "клиент {peer}: TLS-рукопожатие не удалось: {detail}"
 error.starttls_handshake: "клиент {peer}: StartTLS-рукопожатие не удалось"
-error.malformed: "клиент {peer} прислал некорректное сообщение, соединение закрыто"
+error.malformed: "клиент {peer} прислал сообщение, которое сервер не разбирает ({detail}); первые октеты: {head}"
 error.client: "клиент {peer}: {detail}"
 error.sync_lagged: "соединение {peer} отстало на {missed} изменений; постоянные поиски на нём сняты"
 error.sasl: "ошибка sasl: {detail}"

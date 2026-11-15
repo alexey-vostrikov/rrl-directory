@@ -14,6 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Tag of a BER `SEQUENCE`, the only top-level tag an LDAP message uses.
 const SEQUENCE_TAG: u8 = 0x30;
+
 /// Lengths above this are refused instead of being allocated.
 pub const MAX_FRAME_LEN: usize = 1 << 20;
 /// Long-form lengths longer than this are refused (RFC 4511 has no use for them).
@@ -320,6 +321,62 @@ pub async fn write_message_with<W: AsyncWrite + Unpin>(
     }
 }
 
+/// Writes one message with whatever layer `session` has in force.
+///
+/// One function rather than two layer arguments at every call site: a session holds both an RFC 4121
+/// wrap and an NTLM layer, and taking two mutable borrows of it at one call is exactly what the
+/// borrow checker refuses - correctly, because the two would then be free to disagree about which is
+/// active.
+pub async fn write_to<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &LdapMessage,
+    session: &mut super::session::Session,
+) -> Result<(), CodecError> {
+    // The answer that completes the NTLM bind goes out in the clear: the client is not protecting
+    // anything yet when it reads that one, and a sealed frame is to it a message it cannot parse.
+    let plain_once = session.take_ntlm_plain_write();
+    if session.has_ntlm_layer() && !plain_once {
+        let bytes = encode(message)?;
+        let layer = session
+            .ntlm_out()
+            .ok_or_else(|| CodecError::Wrap("an NTLM layer with no sending half".to_string()))?;
+        let protected = layer.protect(&bytes);
+        let length = u32::try_from(protected.len())
+            .map_err(|_| CodecError::Write(std::io::Error::other("a message longer than 4 GiB")))?;
+        writer
+            .write_all(&length.to_be_bytes())
+            .await
+            .map_err(CodecError::Write)?;
+        return writer
+            .write_all(&protected)
+            .await
+            .map_err(CodecError::Write);
+    }
+    write_message_with(writer, message, session.wrap()).await
+}
+
+/// Reads one message with whatever layer `session` has in force.
+pub async fn read_from<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    session: &mut super::session::Session,
+) -> Result<Vec<u8>, CodecError> {
+    if !session.has_ntlm_layer() {
+        return read_message_with(reader, session.wrap()).await;
+    }
+    // Four octets of length, then the protected frame: the framing RFC 4422 §3.2 gives a SASL layer,
+    // and the only one under which a reader can find the boundaries of messages whose insides it
+    // cannot see.
+    let mut head = [0u8; 4];
+    read_exact_or_eof(reader, &mut head).await?;
+    let length = u32::from_be_bytes(head) as usize;
+    let mut frame = vec![0u8; length];
+    read_exact_or_eof(reader, &mut frame).await?;
+    let layer = session
+        .ntlm_in()
+        .ok_or_else(|| CodecError::Wrap("an NTLM layer with no receiving half".to_string()))?;
+    layer.unprotect(&frame).map_err(CodecError::Wrap)
+}
+
 /// Encodes a message for the wire.
 pub fn encode(message: &LdapMessage) -> Result<Vec<u8>, CodecError> {
     rasn::ber::encode(message).map_err(|err| CodecError::Encode(err.to_string()))
@@ -552,5 +609,44 @@ mod tests {
         let bytes = read_message(&mut server).await.expect("read");
 
         assert_eq!(decode(&bytes).expect("decode"), original);
+    }
+
+    /// The 67 octets a stock Windows Server 2022 sends when `Add-Computer` opens port 389, taken
+    /// verbatim from the stand: LDAP **v2**, the name `NTLM`, and the NTLMSSP negotiate in a `[10]`
+    /// where RFC 4511 has `simple [0]`. The version block in the token is `10.0.20348`.
+    ///
+    /// Without this the message is a decode failure, and the client is told nothing: it reports
+    /// `0x37`, "the specified network resource or device is no longer available", which names
+    /// neither the field nor the message.
+    #[test]
+    fn the_sicily_bind_a_windows_client_sends_is_decoded() {
+        let captured = [
+            0x30, 0x84, 0x00, 0x00, 0x00, 0x3d, 0x02, 0x02, 0x00, 0xbc, 0x60, 0x84, 0x00, 0x00,
+            0x00, 0x33, 0x02, 0x01, 0x02, 0x04, 0x04, 0x4e, 0x54, 0x4c, 0x4d, 0x8a, 0x28, 0x4e,
+            0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00, 0x01, 0x00, 0x00, 0x00, 0xb7, 0x82, 0x08,
+            0xe2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x0a, 0x00, 0x7c, 0x4f, 0x00, 0x00, 0x00, 0x0f,
+        ];
+        let message = decode(&captured).expect("the Sicily bind decodes");
+        let rasn_ldap::ProtocolOp::BindRequest(bind) = &message.protocol_op else {
+            panic!("a bind, not {:?}", message.protocol_op);
+        };
+        assert_eq!(bind.version, 2);
+        assert_eq!(bind.name.to_string(), "NTLM");
+        let rasn_ldap::AuthenticationChoice::SicilyNegotiate(token) = &bind.authentication else {
+            panic!(
+                "the token arrives in the tag Microsoft puts it in, not in `simple`: {:?}",
+                bind.authentication
+            );
+        };
+        assert!(
+            token.as_ref().starts_with(b"NTLMSSP\0"),
+            "the value is the NTLM message itself, not an OCTET STRING around it"
+        );
+        assert_eq!(
+            token.as_ref().len(),
+            0x28,
+            "and it is exactly what it declared"
+        );
     }
 }

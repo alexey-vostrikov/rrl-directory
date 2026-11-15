@@ -13,6 +13,10 @@ pub mod modify;
 /// ticket. Behind the `smb` feature because the verification is `smb_server`'s, not a second copy.
 #[cfg(feature = "smb")]
 pub mod ntlm_bind;
+/// The NTLM security layer: what a `wldap32` demands after an NTLM bind, and refuses without
+/// (`53 Unwilling To Perform`, produced by the client). It is not behind `smb`: this module is the
+/// layer on its own, and the accept is what needs the SMB crate.
+pub mod ntlm_layer;
 pub mod paged;
 pub mod responses;
 pub mod sasl_bind;
@@ -764,7 +768,7 @@ mod tests {
             8,
             ProtocolOp::BindResponse(BindResponse::new(
                 ResultCode::Success,
-                LdapDn::from(""),
+                rasn::types::OctetString::from_static(b""),
                 LdapString::from(""),
                 None,
                 None,

@@ -2317,6 +2317,7 @@ dependencies = [
  "pbkdf2",
  "rasn",
  "rasn-ldap",
+ "rc4",
  "rcgen",
  "redb",
  "roaring",

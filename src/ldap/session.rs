@@ -83,6 +83,23 @@ pub struct Session {
     /// with the identity, which is what [`Session::reset`] does - a connection that loses its
     /// identity must not keep a channel the other side still believes in.
     wrap: Option<super::sasl_bind::Wrap>,
+    /// The NTLM security layer towards the client, once a bind has produced a session key.
+    ///
+    /// Outside [`Session::sasl`] because it outlives the exchange: the exchange ends when the bind
+    /// succeeds and the layer begins at exactly that moment, sealing every answer after it. A client
+    /// that negotiated `SIGN | SEAL` refuses a bind that completes without this
+    /// (`53 Unwilling To Perform`, produced on the client's side) - see [`crate::ldap::ntlm_layer`].
+    ntlm_out: Option<crate::ldap::ntlm_layer::NtlmLayer>,
+    /// The same layer in the other direction: what the client seals its requests with.
+    ntlm_in: Option<crate::ldap::ntlm_layer::NtlmLayer>,
+    /// Set while the answer that completes the NTLM bind is still unwritten.
+    ///
+    /// That answer travels in the clear, and every message after it is protected. The reason is
+    /// measured: a client that negotiated `SIGN | SEAL` reads the `BindResponse` before it has begun
+    /// protecting anything, so a sealed frame is to it a message it cannot parse - the join waited
+    /// thirty seconds and reported `85: Timeout`, having accepted the same bind a round earlier with
+    /// a different failure. One message, in the clear, then the layer.
+    ntlm_plain_next_write: bool,
 }
 
 impl Session {
@@ -131,6 +148,44 @@ impl Session {
         self.ntlm_challenge = None;
         self.ntlm_negotiate = None;
         self.wrap = None;
+        // The security layer is part of what authentication established: a new bind on this
+        // connection is a new identity, and sealing with the previous one's keys would be sealing
+        // for somebody who is no longer the subject.
+        self.ntlm_out = None;
+        self.ntlm_in = None;
+        self.ntlm_plain_next_write = false;
+    }
+
+    /// Installs the NTLM security layer both ways, from the flags and key the bind produced.
+    ///
+    /// `None` when the client negotiated neither signing nor sealing: a layer nobody asked for is a
+    /// change of terms, and the session stays as it was.
+    pub fn install_ntlm_layer(&mut self, flags: u32, session_key: &[u8; 16]) {
+        use crate::ldap::ntlm_layer::{Direction, NtlmLayer};
+        self.ntlm_out = NtlmLayer::new(flags, session_key, Direction::ServerToClient);
+        self.ntlm_in = NtlmLayer::new(flags, session_key, Direction::ClientToServer);
+        // The bind's own answer goes out in the clear; see the field.
+        self.ntlm_plain_next_write = self.ntlm_out.is_some();
+    }
+
+    /// Whether the next answer must travel unprotected, clearing the mark as it answers.
+    pub fn take_ntlm_plain_write(&mut self) -> bool {
+        std::mem::take(&mut self.ntlm_plain_next_write)
+    }
+
+    /// Whether an NTLM security layer is in force.
+    pub fn has_ntlm_layer(&self) -> bool {
+        self.ntlm_in.is_some() || self.ntlm_out.is_some()
+    }
+
+    /// The layer that protects what this server sends.
+    pub fn ntlm_out(&mut self) -> Option<&mut crate::ldap::ntlm_layer::NtlmLayer> {
+        self.ntlm_out.as_mut()
+    }
+
+    /// The layer that protects what the client sends.
+    pub fn ntlm_in(&mut self) -> Option<&mut crate::ldap::ntlm_layer::NtlmLayer> {
+        self.ntlm_in.as_mut()
     }
 
     /// The challenge this connection must see answered, when an NTLM bind is under way.

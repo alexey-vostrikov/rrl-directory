@@ -210,8 +210,12 @@ pub(crate) fn step(
             // CHALLENGE message exactly as it was sent, and that message carries the time. A rebuilt
             // challenge stamped "now" is different octets, and the answer then cannot verify.
             let stamp = now_filetime();
-            let mut server =
-                smb_server::NtlmServer::without_signing(challenge, target(security), stamp);
+            // Signing is offered, and that is the whole reason this is `new` and not
+            // `without_signing`: a `wldap32` asked to sign and seal the connection (which the join
+            // does) reads a challenge whose flags have `SIGN`/`SEAL` cleared as a server that cannot
+            // protect it, and reports `53 Unwilling To Perform` from its own side while this server
+            // has answered `success`. Measured on the stand, twice, in two different rounds.
+            let mut server = smb_server::NtlmServer::new(challenge, target(security), stamp);
             // `step1_negotiate` stores the client's octets, which the MIC also covers, and
             // intersects the flags both sides set.
             server
@@ -254,6 +258,7 @@ pub(crate) fn step(
                 identity: None,
                 diagnostic: String::new(),
                 wrap: None,
+                ntlm: None,
             })
         }
 
@@ -268,8 +273,7 @@ pub(crate) fn step(
                 ));
             };
 
-            let mut server =
-                smb_server::NtlmServer::without_signing(challenge, target(security), stamp);
+            let mut server = smb_server::NtlmServer::new(challenge, target(security), stamp);
             // Replayed into the acceptor so the MIC can be verified: it covers the negotiate, the
             // challenge and the answer together, and the acceptor holds none of it between rounds.
             if let Some(negotiate) = session.ntlm_negotiate() {
@@ -341,6 +345,9 @@ pub(crate) fn step(
                 identity: Some(identity),
                 diagnostic: String::new(),
                 wrap: None,
+                // The session key and the flags: everything the security layer is derived from. Both
+                // are facts of the accept, and the layer is built by whoever answers the bind.
+                ntlm: Some((outcome.flags, outcome.session_key)),
             })
         }
 
@@ -383,6 +390,7 @@ pub(crate) fn layer_round(session: &Session, token: &[u8]) -> Result<Round, Sasl
         identity: None,
         diagnostic: String::new(),
         wrap: None,
+        ntlm: None,
     })
 }
 

@@ -615,6 +615,7 @@ pub fn handle_gssapi(
             identity,
             diagnostic,
             wrap,
+            ntlm: _,
         }) => {
             if let Some(identity) = identity {
                 session.set_identity(identity);
@@ -668,6 +669,16 @@ pub(crate) struct Round {
     pub(crate) credentials: Option<Vec<u8>>,
     pub(crate) identity: Option<Identity>,
     pub(crate) diagnostic: String,
+    /// The NTLM session key and the flags it was agreed under, when this round completed an NTLM
+    /// bind.
+    ///
+    /// Carried out of the accept because the security layer is derived from them and the layer is
+    /// the session's, not the exchange's: a Windows client refuses a bind that completes without
+    /// one, and the keys are the only thing that can build it.
+    ///
+    /// Read by the Sicily path, which installs the layer from it; the other rounds carry `None`.
+    #[cfg_attr(not(feature = "smb"), allow(dead_code))]
+    pub(crate) ntlm: Option<(u32, [u8; 16])>,
     /// The security layer this round puts in place, when it is the last one.
     ///
     /// Set only by `spnego_finish`: a client on `gensec` has no RFC 4752 mask to negotiate and
@@ -892,6 +903,7 @@ fn begin(
         identity: complete.then_some(identity),
         diagnostic: String::new(),
         wrap: Some(Wrap::implied(layer)),
+        ntlm: None,
     })
 }
 
@@ -915,6 +927,7 @@ fn offer_spnego(session: &mut Session) -> Result<Round, SaslError> {
         identity: None,
         diagnostic: String::new(),
         wrap: None,
+        ntlm: None,
     })
 }
 
@@ -1012,6 +1025,7 @@ fn spnego_accept(
         identity: None,
         diagnostic: String::new(),
         wrap: Some(Wrap::implied(layer)),
+        ntlm: None,
     })
 }
 
@@ -1049,6 +1063,7 @@ fn spnego_finish(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslErr
         // frame. Samba seals (`0x0505`), a client that asked for integrity signs (`0x0504`), and a
         // server that guessed wrong answered in a framing the client could not open.
         wrap: Some(Wrap::implied(tokens)),
+        ntlm: None,
     })
 }
 
@@ -1098,6 +1113,7 @@ fn offer_layer(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslError
         identity: None,
         diagnostic: String::new(),
         wrap: None,
+        ntlm: None,
     })
 }
 
@@ -1168,6 +1184,7 @@ fn accept_choice(session: &mut Session, token: Vec<u8>) -> Result<Round, SaslErr
         identity: Some(identity),
         diagnostic: String::new(),
         wrap,
+        ntlm: None,
     })
 }
 
@@ -1315,7 +1332,7 @@ fn sasl_response(
         message_id,
         rasn_ldap::ProtocolOp::BindResponse(rasn_ldap::BindResponse::new(
             code,
-            rasn_ldap::LdapDn::from(""),
+            rasn::types::OctetString::from_static(b""),
             diagnostic.into(),
             None,
             credentials.map(rasn::types::OctetString::from),

@@ -25,7 +25,33 @@ pub fn bind_response(message_id: MessageId, code: ResultCode, diagnostic: &str) 
         message_id,
         ProtocolOp::BindResponse(BindResponse::new(
             code,
-            LdapDn::from(""),
+            rasn::types::OctetString::from_static(b""),
+            diagnostic.into(),
+            None,
+            None,
+        )),
+    )
+}
+
+/// A `BindResponse` whose `matchedDN` holds `token` - octets, not a distinguished name.
+///
+/// That is not a misuse of the field: it is the whole of Microsoft's legacy NTLM bind (the "Sicily"
+/// dialect), where the server's half of the conversation travels in `matchedDN` and the result code
+/// says only whether the bind has succeeded. A client of this dialect reads the challenge from
+/// there and nothing else - `ldap3`'s `sicily_bind_response_to_dict` takes `server_creds` from
+/// `matchedDN`, `impacket` likewise - so a challenge put in `serverSaslCreds` is a challenge nobody
+/// reads, and the client simply stops.
+pub fn bind_response_with_matched_dn(
+    message_id: MessageId,
+    code: ResultCode,
+    token: &[u8],
+    diagnostic: &str,
+) -> LdapMessage {
+    LdapMessage::new(
+        message_id,
+        ProtocolOp::BindResponse(BindResponse::new(
+            code,
+            rasn::types::OctetString::from_slice(token),
             diagnostic.into(),
             None,
             None,
@@ -284,7 +310,7 @@ mod tests {
             ProtocolOp::SearchResDone(done) => {
                 assert_eq!(done.0.result_code, ResultCode::UnwillingToPerform);
                 assert_eq!(done.0.diagnostic_message.0, "not supported");
-                assert_eq!(done.0.matched_dn.0, "");
+                assert!(done.0.matched_dn.is_empty());
             }
             other => panic!("unexpected: {other:?}"),
         }

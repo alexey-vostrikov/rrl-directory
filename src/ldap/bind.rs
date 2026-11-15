@@ -82,6 +82,19 @@ fn authenticate(
         return super::sasl_bind::handle_gssapi(session, directory, message_id, request, security);
     }
 
+    // The Sicily bind, before the version check because it is a *version 2* bind: Microsoft's LDAP
+    // client sends the name `NTLM` and an NTLMSSP message where a password would go, and it does so
+    // before the machine has any ticket. Measured on the AD-join stand: an `Add-Computer` from a
+    // stock Windows Server 2022 opens 389 and sends exactly this, and a server that answered
+    // `protocolError: only version 3` left the join at `0x37`.
+    //
+    // Returned before `session.reset()`: like any multi-round bind, the challenge outstanding on
+    // this connection is what the second message is checked against.
+    if let Some((round, token)) = Sicily::of(request) {
+        let token = token.to_vec();
+        return sicily_round(session, directory, message_id, round, &token, security);
+    }
+
     session.reset();
 
     if request.version != 3 {
@@ -797,5 +810,120 @@ mod tests {
 
         assert_eq!(code(&response), ResultCode::Success);
         assert_eq!(session.identity().expect("identity").dn, ADMIN_DN);
+    }
+}
+
+/// What a Sicily bind asks for, if it is one.
+///
+/// Microsoft's extension to `AuthenticationChoice`: three context tags RFC 4511 leaves out, used for
+/// the legacy NTLM bind a Windows machine sends before it has a ticket (`MS-ADTS`; the shape `ldap3`
+/// and `impacket` both speak). The tag names the round, and with no argument the tag alone is the
+/// whole message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sicily {
+    /// `[9]`: which packages the server offers, answered with their names in `matchedDN`.
+    PackageDiscovery,
+    /// `[10]`: the client's NTLM NEGOTIATE, answered with the challenge in `matchedDN`.
+    Negotiate,
+    /// `[11]`: the client's NTLM AUTHENTICATE, answered with `success` or a refusal.
+    Response,
+}
+
+impl Sicily {
+    /// The round this request is, and the token it carried.
+    fn of(request: &BindRequest) -> Option<(Self, &[u8])> {
+        match &request.authentication {
+            AuthenticationChoice::SicilyPackageDiscovery(token) => {
+                Some((Self::PackageDiscovery, token.as_ref()))
+            }
+            AuthenticationChoice::SicilyNegotiate(token) => Some((Self::Negotiate, token.as_ref())),
+            AuthenticationChoice::SicilyResponse(token) => Some((Self::Response, token.as_ref())),
+            _ => None,
+        }
+    }
+}
+
+/// One round of the Sicily NTLM bind.
+///
+/// # Where the answer's token goes
+///
+/// Not in `serverSaslCreds`, which is where a SASL mechanism's half belongs: the Sicily exchange
+/// puts the challenge in **`matchedDN`** and reports `success` for the negotiate round, which is
+/// what every client of this dialect reads (`ldap3`'s `sicily_bind_response_to_dict` takes
+/// `server_creds` from `matchedDN`, and `impacket` does the same). Answering in the SASL field with
+/// `saslBindInProgress` is answered by silence: measured on the AD-join stand, the client sent its
+/// NEGOTIATE, read a `serverSaslCreds` it was not looking at, and stopped - the join then reported
+/// `ERROR_INVALID_LEVEL`, which names neither LDAP nor the bind.
+fn sicily_round(
+    session: &mut Session,
+    directory: &Directory,
+    message_id: MessageId,
+    round: Sicily,
+    token: &[u8],
+    security: &Security,
+) -> rasn_ldap::LdapMessage {
+    // The packages this server can speak. One, and named the way a client compares it: `ldap3`
+    // splits the value on `;`, and every Windows dialect spells the package this server checks.
+    const PACKAGES: &str = "NTLM";
+
+    if round == Sicily::PackageDiscovery {
+        return super::responses::bind_response_with_matched_dn(
+            message_id,
+            ResultCode::Success,
+            PACKAGES.as_bytes(),
+            "",
+        );
+    }
+
+    #[cfg(feature = "smb")]
+    {
+        match super::ntlm_bind::step(session, directory, token, security) {
+            Ok(step) => {
+                tracing::debug!(
+                    round = ?round,
+                    code = ?step.code,
+                    token = token.len(),
+                    "ntlm: sicily round"
+                );
+                if let Some(identity) = step.identity.clone() {
+                    session.set_identity(identity);
+                    session.clear_sasl();
+                }
+                // The layer is installed before the answer is written, because the answer is the
+                // first thing it protects: a client that negotiated `SIGN | SEAL` reads a
+                // `BindResponse` in the clear as a bind that failed, and reports `53 Unwilling To
+                // Perform` from its own security package while this server has answered `success`.
+                if let Some((flags, key)) = step.ntlm {
+                    session.install_ntlm_layer(flags, &key);
+                }
+                // Both rounds answer `success`: this dialect reports the outcome of the *bind*, and
+                // the state of the NTLM conversation is carried by the token in `matchedDN`.
+                match &step.credentials {
+                    Some(credentials) => super::responses::bind_response_with_matched_dn(
+                        message_id,
+                        ResultCode::Success,
+                        credentials,
+                        &step.diagnostic,
+                    ),
+                    None => bind_response(message_id, ResultCode::Success, &step.diagnostic),
+                }
+            }
+            Err(err) => {
+                // RFC 4513: a failed bind leaves the connection anonymous, and a half-finished NTLM
+                // exchange must not be resumable into an authenticated one.
+                session.reset();
+                bind_response(message_id, ResultCode::InvalidCredentials, &err.to_string())
+            }
+        }
+    }
+    #[cfg(not(feature = "smb"))]
+    {
+        let _ = (session, directory, token, security, round);
+        bind_response(
+            message_id,
+            ResultCode::AuthMethodNotSupported,
+            "this server was built without the SMB acceptor, so it cannot check an NTLM token: \
+             a Windows machine joins it only with a Kerberos ticket",
+        )
     }
 }

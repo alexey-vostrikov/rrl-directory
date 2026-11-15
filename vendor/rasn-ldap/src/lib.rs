@@ -376,6 +376,22 @@ pub enum AuthenticationChoice {
     // 1 and 2 are reserved.
     #[rasn(tag(3))]
     Sasl(SaslCredentials),
+    /// `sicilyPackageDiscovery [9] OCTET STRING`, from Microsoft's extension to this CHOICE.
+    ///
+    /// Not in RFC 4511: Microsoft documents three context tags 9, 10 and 11 for the "Sicily"
+    /// protocol, which is how a Windows machine sends NTLM in a bind before it has any ticket
+    /// (`MS-ADTS` legacy NTLM authentication, and the shape `ldap3` and `impacket` both speak). A
+    /// CHOICE rejected outright here is a decode failure, and the client is told nothing: measured on
+    /// the AD-join stand, an `Add-Computer` from Windows Server 2022 sent `8a 28 "NTLMSSP..."` and
+    /// the join stopped at `0x37`.
+    #[rasn(tag(9))]
+    SicilyPackageDiscovery(OctetString),
+    /// `sicilyNegotiate [10] OCTET STRING`: the client's NTLM NEGOTIATE.
+    #[rasn(tag(10))]
+    SicilyNegotiate(OctetString),
+    /// `sicilyResponse [11] OCTET STRING`: the client's NTLM AUTHENTICATE.
+    #[rasn(tag(11))]
+    SicilyResponse(OctetString),
 }
 
 #[derive(AsnType, Encode, Decode, Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
@@ -404,7 +420,15 @@ impl SaslCredentials {
 #[rasn(tag(application, 1))]
 pub struct BindResponse {
     pub result_code: ResultCode,
-    pub matched_dn: LdapDn,
+    /// `matchedDN`, and **octets** rather than an `LDAPString` on this one message.
+    ///
+    /// `LDAPDN ::= LDAPString` is text for every use the RFC gives it, and for every other message
+    /// in this crate it stays text. A `BindResponse` is where Microsoft's legacy NTLM bind (the
+    /// "Sicily" dialect) carries the server's half of the NTLM conversation, which is binary, and a
+    /// `String` cannot hold it: the challenge verifies the client's answer byte for byte, so a lossy
+    /// round trip through UTF-8 would produce a bind nobody can complete. On the wire both are an
+    /// `OCTET STRING`, so the encoding of a DN is unchanged.
+    pub matched_dn: OctetString,
     pub diagnostic_message: LdapString,
     #[rasn(tag(3))]
     pub referral: Option<Referral>,
@@ -416,7 +440,7 @@ impl BindResponse {
     /// BindResponse constructor
     pub fn new(
         result_code: ResultCode,
-        matched_dn: LdapDn,
+        matched_dn: OctetString,
         diagnostic_message: LdapString,
         referral: Option<Referral>,
         server_sasl_creds: Option<OctetString>,

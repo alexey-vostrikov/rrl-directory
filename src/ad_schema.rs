@@ -148,6 +148,29 @@ attributetype ( 1.3.6.1.4.1.7165.2.1.25 NAME 'sambaNTPassword'
     EQUALITY caseIgnoreIA5Match
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.26{32} SINGLE-VALUE )
 
+# --- the DNS vocabulary, where a zone lives in the tree -----------------------------------
+#
+# A zone is stored the way AD stores it: a `dnsZone` object under `CN=RRLDNS`, and one `dnsNode`
+# below it per owner name, each carrying `dnsRecord` values in the binary shape [MS-DNSP] 2.3.2.2
+# gives them. The definitions are Microsoft's, OID for OID, so a tool that reads this directory with
+# the AD schema in hand finds what it expects - and, more to the point here, so a directory running
+# in `strict` mode accepts the zone this server writes itself. Without them the server's own
+# provisioning failed its own schema check on every entry it created.
+attributetype ( 1.2.840.113556.1.4.382 NAME 'dnsRecord'
+    EQUALITY octetStringMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 )
+
+# The zone's own settings, one blob each: type, whether dynamic updates are allowed, and the aging
+# intervals. Opaque to a reader that does not parse [MS-DNSP], and written by the server itself.
+attributetype ( 1.2.840.113556.1.4.1306 NAME 'dNSProperty'
+    EQUALITY octetStringMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 )
+
+# A deleted record, kept as a marker until the tombstone period ends.
+attributetype ( 1.2.840.113556.1.4.1414 NAME 'dNSTombstoned'
+    EQUALITY booleanMatch
+    SYNTAX 1.3.6.1.4.1.1466.115.121.1.7 SINGLE-VALUE )
+
 attributetype ( 1.2.840.113556.1.4.373 NAME 'operatingSystem'
     EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch
     SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE )
@@ -220,6 +243,24 @@ impl UserAccountControl {
     }
 }
 
+/// The DNS classes, published beside the attributes because they are the same vocabulary.
+///
+/// In its own document rather than in `AD_OVERRIDES`: these are AD's own definitions, not an AD
+/// reading that differs from X.500's, and the override document exists for the latter.
+const DNS_CLASSES: &str = "
+# A zone: the object a client lists when it enumerates the domain's DNS. `dc` is required because the
+# zone's own name is its RDN - `dc=ad.example.com,cn=RRLDNS,...` - and so is a node's.
+objectclass ( 1.2.840.113556.1.5.85 NAME 'dnsZone' SUP top STRUCTURAL
+    MUST dc
+    MAY ( dNSProperty $ description $ managedBy ) )
+
+# One owner name inside a zone, and the records that name holds. `dnsRecord` is multi-valued: the
+# apex carries a SOA, an NS and an A in three values of one attribute.
+objectclass ( 1.2.840.113556.1.5.86 NAME 'dnsNode' SUP top STRUCTURAL
+    MUST dc
+    MAY ( dnsRecord $ dNSProperty $ dNSTombstoned $ description ) )
+";
+
 /// Where AD's reading of a standard class differs from X.500's, the AD reading wins.
 ///
 /// Measured against the AD schema Microsoft publishes (`MS-AD_Schema_2K8_R2_Classes.txt`, shipped
@@ -257,6 +298,7 @@ objectclass ( 1.2.840.113556.1.5.9 NAME 'user' SUP organizationalPerson STRUCTUR
 /// and the definitions above are constants that a test parses on every run.
 pub fn extend(schema: &mut Schema) -> Result<(), String> {
     schema.extend(AD_EXTENSION).map_err(|err| err.to_string())?;
+    schema.extend(DNS_CLASSES).map_err(|err| err.to_string())?;
     schema.replace(AD_OVERRIDES).map_err(|err| err.to_string())
 }
 
@@ -342,6 +384,46 @@ mod tests {
     /// violation named the attribute rather than the class that should have permitted it. The
     /// bootstrap's entry is a principal, so it is `krb5Principal`'s `MAY` list that has to carry
     /// the name - not `user`'s, which nothing in that path adds.
+    /// The zone this server writes itself has to pass its own schema check: a directory in `strict`
+    /// mode that refused its own provisioning would be a server that cannot start with `dns:`
+    /// enabled, and the complaint would name `dnsNode` as an unknown class.
+    #[test]
+    fn an_entry_shaped_like_a_dns_zone_and_its_nodes_validates() {
+        let schema = with_ad();
+        let zone = crate::model::Entry::new(
+            "dc=ad.example.com,cn=RRLDNS,dc=DomainDnsZones,dc=ad,dc=example,dc=com",
+            crate::model::Attributes::new()
+                .push(crate::model::Attribute::new(
+                    "objectClass",
+                    vec!["top".to_string(), "dnsZone".to_string()],
+                ))
+                .push(crate::model::Attribute::single("dc", "ad.example.com"))
+                .push(
+                    crate::model::Attribute::new("dNSProperty", vec!["AAECAw==".to_string()])
+                        .binary(),
+                ),
+        );
+        if let Err(violations) = schema.check(&zone) {
+            panic!("a zone object must validate: {violations:?}");
+        }
+
+        let node = crate::model::Entry::new(
+            "dc=_ldap._tcp,dc=ad.example.com,cn=RRLDNS,dc=DomainDnsZones,dc=ad,dc=example,dc=com",
+            crate::model::Attributes::new()
+                .push(crate::model::Attribute::new(
+                    "objectClass",
+                    vec!["top".to_string(), "dnsNode".to_string()],
+                ))
+                .push(crate::model::Attribute::single("dc", "_ldap._tcp"))
+                .push(
+                    crate::model::Attribute::new("dnsRecord", vec!["AAECAw==".to_string()]).binary(),
+                ),
+        );
+        if let Err(violations) = schema.check(&node) {
+            panic!("a zone node must validate: {violations:?}");
+        }
+    }
+
     #[test]
     fn an_entry_shaped_like_a_realm_principal_carrying_an_nt_hash_validates() {
         #[allow(unused_mut)]

@@ -75,6 +75,17 @@ pub struct Cli {
     #[arg(long = "import-ldif", value_name = "PATH", conflicts_with = "listen")]
     pub import_ldif: Option<PathBuf>,
 
+    /// Write this controller's own keys to PATH as a keytab and exit
+    ///
+    /// SMB accepts Kerberos only when the server holds the key a client's service ticket was sealed
+    /// with, and this is where that key comes from: the domain's own account for this controller,
+    /// created here when the domain has none. Point `smb.keytab` (and `sasl.keytab`, for GSSAPI on
+    /// LDAP) at the file afterwards.
+    ///
+    /// The file is the controller's password: it is written 0600 and read at start.
+    #[arg(long = "export-keytab", value_name = "PATH", conflicts_with = "listen")]
+    pub export_keytab: Option<PathBuf>,
+
     /// Import into a store that already holds entries
     ///
     /// Off by default, because a mistyped path that merges a dump into a live directory is
@@ -160,6 +171,7 @@ impl From<Cli> for config::Args {
             debug: cli.debug,
             export_ldif: cli.export_ldif,
             export_yaml: cli.export_yaml,
+            export_keytab: cli.export_keytab,
             export_operational: cli.export_operational,
             import_ldif: cli.import_ldif,
             allow_existing_entry: cli.allow_existing_entry,

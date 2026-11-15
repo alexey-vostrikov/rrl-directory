@@ -25,6 +25,7 @@
 
 pub mod accounts;
 pub mod bootstrap;
+pub mod keytab_export;
 pub mod machine_password;
 pub mod pac_issuer;
 pub mod realm;

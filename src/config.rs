@@ -46,6 +46,8 @@ pub struct Args {
     pub export_ldif: Option<PathBuf>,
     /// The same, in YAML instead of LDIF.
     pub export_yaml: Option<PathBuf>,
+    /// Present when the run writes this controller's keytab rather than serving.
+    pub export_keytab: Option<PathBuf>,
     pub export_operational: bool,
     /// Present when the run imports an LDIF file rather than serving.
     pub import_ldif: Option<PathBuf>,

@@ -326,7 +326,7 @@ impl RealmView {
 /// binary value in a text file. An attribute that does not decode is passed through untouched: the
 /// mapping in the KDC decides what to make of it, and a silent `unwrap_or_default` here would turn a
 /// corrupt key into a valid empty one.
-fn to_realm_attributes(attributes: &crate::model::Attributes) -> Attributes {
+pub(crate) fn to_realm_attributes(attributes: &crate::model::Attributes) -> Attributes {
     let mut out = Attributes::new();
     for attribute in attributes.values() {
         let name = attribute.name.as_ref();

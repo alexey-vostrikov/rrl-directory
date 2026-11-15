@@ -47,7 +47,7 @@ pub enum Outcome {
 /// a `KDC_ERR_ETYPE_NOSUPP` it would report as a configuration fault. RC4 is deliberately absent:
 /// this realm has no reason to speak it, and a key that can be attacked offline with a commodity
 /// GPU is a key that will be.
-const ENCTYPES: [Enctype; 4] = [
+pub(crate) const ENCTYPES: [Enctype; 4] = [
     Enctype::Aes256Sha384,
     Enctype::Aes128Sha256,
     Enctype::Aes256Sha1,

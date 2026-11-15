@@ -98,6 +98,7 @@ async fn serve() {
     let args: config::Args = cli::Cli::parse().into();
     let export = args.export_ldif.clone();
     let export_yaml = args.export_yaml.clone();
+    let export_keytab = args.export_keytab.clone();
     let export_operational = args.export_operational;
     let import_ldif = args.import_ldif.clone();
     let allow_existing_entry = args.allow_existing_entry;
@@ -377,6 +378,72 @@ async fn serve() {
             std::process::exit(1);
         }
         return;
+    }
+
+    // The controller's own keytab: a one-shot write like the import below, and the only thing that
+    // lets SESSION_SETUP accept a ticket rather than fall back to NTLM.
+    if let Some(path) = export_keytab {
+        #[cfg(feature = "kdc")]
+        {
+            let realm = match config.kerberos.realm.as_deref() {
+                Some(realm) => realm.to_string(),
+                None => fatal(&i18n::t(
+                    "error.backend",
+                    &[(
+                        "detail",
+                        "the domain has no `kerberos.realm`, so there is no realm to write a keytab for",
+                    )],
+                )),
+            };
+            let netbios = config
+                .smb
+                .netbios_name
+                .clone()
+                .unwrap_or_else(|| "localhost".to_string());
+            let dns_host = advertised_host(&config);
+            let dns_domain = config
+                .smb
+                .dns_domain
+                .clone()
+                .unwrap_or_else(|| realm.to_ascii_lowercase());
+            match rrl_directory::kerberos::keytab_export::export(
+                &backend,
+                &realm,
+                &config.base_dn,
+                &netbios,
+                &dns_host,
+                &dns_domain,
+                &path,
+            )
+            .await
+            {
+                Ok(exported) => {
+                    println!(
+                        "keytab: {} ({}, account {})",
+                        exported.path.display(),
+                        if exported.created {
+                            "written, and this domain's account for the controller with it"
+                        } else {
+                            "written from the account the domain already had"
+                        },
+                        exported.dn,
+                    );
+                    for principal in &exported.principals {
+                        println!("  {principal}");
+                    }
+                }
+                Err(detail) => fatal(&i18n::t("error.write", &[("detail", &detail)])),
+            }
+            return;
+        }
+        #[cfg(not(feature = "kdc"))]
+        fatal(&i18n::t(
+            "error.backend",
+            &[(
+                "detail",
+                "this build has no `kdc` feature, so it has no keys to export",
+            )],
+        ));
     }
 
     // An import is a one-shot write, not a server: same shape as the export below, and for

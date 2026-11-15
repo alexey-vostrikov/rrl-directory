@@ -1245,11 +1245,33 @@ async fn serve() {
                     std::sync::Arc<dyn smb_server::MachinePasswords>,
                 > = None;
 
+                // Where `samr_CreateUser2` creates the machine account. `Add-Computer` asks over RPC
+                // rather than over LDAP, and before it has a ticket: this is the only door.
+                #[cfg(feature = "kdc")]
+                let machine_accounts: Option<
+                    std::sync::Arc<dyn smb_server::MachineAccounts>,
+                > = match (&domain, config.kerberos.enabled) {
+                    (Some(issuer), true) => Some(std::sync::Arc::new(
+                        rrl_directory::kerberos::accounts::DirectoryAccounts::new(
+                            std::sync::Arc::clone(&source),
+                            std::sync::Arc::clone(issuer),
+                            config.base_dn.clone(),
+                            settings.dns_domain.clone(),
+                        ),
+                    )),
+                    _ => None,
+                };
+                #[cfg(not(feature = "kdc"))]
+                let machine_accounts: Option<
+                    std::sync::Arc<dyn smb_server::MachineAccounts>,
+                > = None;
+
                 match rrl_directory::smb::serve::start(
                     &settings,
                     machine_secrets,
                     machine_passwords,
                     logon_users,
+                    machine_accounts,
                 )
                 .await
                 {

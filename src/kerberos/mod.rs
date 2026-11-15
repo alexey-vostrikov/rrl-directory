@@ -23,6 +23,7 @@
 //! served for the same reason, and will be when it carries an authorization story rather than a
 //! second door.
 
+pub mod accounts;
 pub mod bootstrap;
 pub mod machine_password;
 pub mod pac_issuer;

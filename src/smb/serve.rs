@@ -60,6 +60,7 @@ pub async fn start(
     machine_secrets: Option<std::sync::Arc<dyn smb_server::MachineSecrets>>,
     machine_passwords: Option<std::sync::Arc<dyn smb_server::MachinePasswords>>,
     logon_users: Option<std::sync::Arc<dyn smb_server::LogonUsers>>,
+    machine_accounts: Option<std::sync::Arc<dyn smb_server::MachineAccounts>>,
 ) -> Result<Running, String> {
     let mut builder = smb_server::SmbServer::builder()
         .listen(settings.bind)
@@ -90,6 +91,11 @@ pub async fn start(
     // the domain it is joining has not issued it one yet.
     if let Some(source) = logon_users {
         builder = builder.logon_users(source);
+    }
+    // Creating the account the join asks for: `Add-Computer` makes it over `samr`, before it has a
+    // ticket, so this is the only door that account can come through.
+    if let Some(accounts) = machine_accounts {
+        builder = builder.machine_accounts(accounts);
     }
     // The DES secure channel, when the deployment asks for it: off unless `smb.netlogon_des` says
     // otherwise, because that channel's credential is two passes of a 56-bit cipher.

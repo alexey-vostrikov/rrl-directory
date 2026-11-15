@@ -9,14 +9,18 @@
 //! already speak AD: entries of class `dnsNode` under the zone, each carrying `dnsRecord` values in
 //! the binary shape of [MS-DNSP] 2.3.2.2. [`record`] reads and writes that shape for one record.
 //!
-//! Deliberately in this order: the value format first, then the zone in the tree, then the listener.
-//! A zone that answers queries out of a blob nothing can read is a zone no other tool can check.
+//! In the order it was built, and the order matters: the value format first, then the zone in the
+//! tree, then the listener. A zone that answers queries out of a blob nothing can read is a zone no
+//! other tool can check.
 //!
-//! Not here yet, and each for a named reason: the wire format (RFC 1035) and the listener on 53,
-//! dynamic updates (RFC 2136) with their GSS-TSIG signatures, and DNSSEC. `dnsRecord` values that
-//! this build does not read are carried through untouched - see [`record::Data::Other`] - so a zone
-//! written by a tool with a wider type set survives a round trip through this server.
+//! Not here yet, and each for a named reason: the records a domain needs written by the server
+//! itself, dynamic updates (RFC 2136) with their GSS-TSIG signatures, and DNSSEC. `dnsRecord`
+//! values that this build does not read are carried through untouched - see
+//! [`record::Data::Other`] - so a zone written by a tool with a wider type set survives a round
+//! trip through this server, and [`zone::Zone::unserved`] names the types it could not answer
+//! with.
 
 pub mod property;
 pub mod record;
 pub mod serve;
+pub mod zone;

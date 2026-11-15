@@ -214,7 +214,7 @@ mod tests {
             dns_domain: "ad.example.com".to_string(),
             dns_host: "dc1.ad.example.com".to_string(),
             address: Ipv4Addr::new(10, 0, 2, 2),
-            serial: 20_261_115_01,
+            serial: 2_026_111_501,
         }
     }
 
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn the_soa_carries_the_serial_it_was_given() {
         let mut with_later = facts();
-        with_later.serial = 20_261_116_01;
+        with_later.serial = 2_026_111_601;
         let directory = |facts: &Facts| {
             Directory::from_entries(
                 "dc=ad,dc=example,dc=com",

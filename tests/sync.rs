@@ -59,6 +59,8 @@ async fn serve(entries: Vec<Entry>) -> String {
         #[cfg(feature = "smb")]
         smb: Default::default(),
         cldap: Default::default(),
+        #[cfg(feature = "dns")]
+        dns: Default::default(),
         cache: Default::default(),
         backend: "redb".to_string(),
         base_dn: BASE.to_string(),

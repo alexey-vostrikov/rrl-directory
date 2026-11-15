@@ -51,7 +51,7 @@ fn zone_serial() -> u32 {
     // because a date format is not worth a dependency.
     let days = (now / 86_400) as i64;
     let (year, month, day) = civil_from_days(days);
-    (year as u32) * 1_000_000 + (month as u32) * 10_000 + (day as u32) * 100 + 1
+    year as u32 * 1_000_000 + month * 10_000 + day * 100 + 1
 }
 
 /// Days since 1970-01-01 to `(year, month, day)`.

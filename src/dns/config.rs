@@ -330,9 +330,9 @@ mod tests {
         )
         .expect("resolves");
         assert_eq!(only_corp.forwarder_for("notcorp.example.com."), None);
-        assert_eq!(
+        assert!(
             only_corp.forwarder_for("a.corp.example.com.").is_some(),
-            true
+            "and its own suffix does match"
         );
     }
 

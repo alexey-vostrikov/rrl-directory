@@ -48,6 +48,8 @@ async fn serve(
         #[cfg(feature = "smb")]
         smb: Default::default(),
         cldap: Default::default(),
+        #[cfg(feature = "dns")]
+        dns: Default::default(),
         cache: Default::default(),
         backend: "null".to_string(),
         base_dn: base.to_string(),

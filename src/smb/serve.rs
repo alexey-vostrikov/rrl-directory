@@ -18,6 +18,8 @@ pub struct Running {
     pub netbios_name: String,
     /// Where `drsuapi` answers over `ncacn_ip_tcp`, and the task serving it.
     pub drsuapi: Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>,
+    /// Where the endpoint mapper answers, and the task serving it.
+    pub epm: Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>,
     /// Stops the accept loop and closes each connection.
     shutdown: smb_server::ShutdownHandle,
     /// The task running it.
@@ -153,6 +155,8 @@ pub async fn start(
                 // server already holds keys for, and a second keytab would be a second answer to
                 // one question.
                 keytab: settings.keytab.clone(),
+                // This listener is the interface itself, not the mapper: nothing is published here.
+                publish: None,
             };
             // A listener that cannot be taken is a startup failure naming the address, which is what
             // an operator can act on; the port is released again immediately, because the task
@@ -169,10 +173,57 @@ pub async fn start(
         }
     };
 
+    // The endpoint mapper, on the same address family: it is what tells a client which port the
+    // `drsuapi` listener above answers on. Started only where that listener is, because a mapper
+    // with nothing to publish would send clients to a port nobody serves.
+    let epm = match (settings.epm_tcp, settings.drsuapi_tcp) {
+        (Some(addr), Some(drsuapi_addr)) => {
+            let endpoint = smb_server::tcp::Endpoint {
+                addr,
+                nb_domain: settings
+                    .domain_netbios
+                    .clone()
+                    .unwrap_or_else(|| settings.netbios_name.clone()),
+                dns_domain: settings.dns_domain.clone().unwrap_or_default(),
+                nb_computer: settings.netbios_name.clone(),
+                dns_computer: settings.dns_domain.as_deref().map_or_else(
+                    || settings.netbios_name.clone(),
+                    |domain| {
+                        format!(
+                            "{}.{}",
+                            settings.netbios_name.to_ascii_lowercase(),
+                            domain.to_ascii_lowercase()
+                        )
+                    },
+                ),
+                keytab: settings.keytab.clone(),
+                publish: Some(smb_server::tcp::Published {
+                    drsuapi_port: drsuapi_addr.port(),
+                }),
+            };
+            std::net::TcpListener::bind(endpoint.addr)
+                .and_then(|probe| probe.set_nonblocking(true))
+                .map_err(|err| {
+                    format!(
+                        "endpoint mapper on {}: {err} (a client cannot find drsuapi without it)",
+                        endpoint.addr
+                    )
+                })?;
+            let task = tokio::spawn(async move {
+                if let Err(err) = smb_server::tcp::serve(endpoint).await {
+                    eprintln!("endpoint mapper: {err}");
+                }
+            });
+            Some((addr, task))
+        }
+        _ => None,
+    };
+
     Ok(Running {
         bind,
         netbios_name: settings.netbios_name.clone(),
         drsuapi,
+        epm,
         shutdown,
         task,
     })

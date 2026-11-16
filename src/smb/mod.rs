@@ -71,10 +71,19 @@ pub struct SmbConfig {
     /// offers no such port is a controller the join cannot reach, whatever else answers correctly -
     /// measured: without it `NetpGetComputerObjectDn` fails with `RPC_S_SERVER_UNAVAILABLE`.
     ///
-    /// Off unless set, because a port nobody asked for is a listener nobody wanted. A real domain
-    /// controller picks a dynamic port and publishes it through the mapper; this states it here
-    /// because the mapper is not implemented yet.
+    /// Off unless set, because a port nobody asked for is a listener nobody wanted. The port is
+    /// stated here rather than picked at start for the same reason a real controller states nothing
+    /// in a file: it is published, and a client reads it from the mapper instead of guessing.
     pub drsuapi_port: Option<u16>,
+    /// The `ncacn_ip_tcp` port the endpoint mapper listens on, 135 unless stated.
+    ///
+    /// The mapper is how a client learns the port above: it asks here, with the interface id it
+    /// wants, and is answered with a tower naming that port. Without it the client's `DsBind` fails
+    /// with `RPC_S_SERVER_UNAVAILABLE` and a join stops - so it is started whenever `drsuapi_port`
+    /// is set, and a port that cannot be taken is a startup error naming it rather than a join that
+    /// fails later for a reason nobody can see from the client side.
+    #[serde(default)]
+    pub epm_port: Option<u16>,
     /// A keytab for Kerberos in SESSION_SETUP.
     ///
     /// Without it the server accepts NTLM only, which a Samba member can use with an administrator's
@@ -101,6 +110,11 @@ pub struct SmbUser {
     pub password_env: String,
 }
 
+/// The port the endpoint mapper listens on unless the configuration states another.
+///
+/// 135 is the port every client asks: a mapper somewhere else is one nothing looks for.
+pub const DEFAULT_EPM_PORT: u16 = 135;
+
 /// The resolved form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -114,6 +128,11 @@ pub struct Settings {
     pub users: Vec<(String, String)>,
     /// Where `drsuapi` is served over `ncacn_ip_tcp`, when it is served at all.
     pub drsuapi_tcp: Option<SocketAddr>,
+    /// Where the endpoint mapper is served, when `drsuapi` is.
+    ///
+    /// Always set together with `drsuapi_tcp`: an endpoint a client cannot find is an endpoint that
+    /// does not exist, which is exactly the fault this pair was written for.
+    pub epm_tcp: Option<SocketAddr>,
     /// The DNS name of the domain, `ad.example.com`.
     ///
     /// Answered by `lsarpc` when a member asks what domain it has reached. A client compares this
@@ -203,16 +222,25 @@ impl Settings {
         }
 
         // A port of zero would ask the operating system to pick one that no client can be told
-        // about: the mapper is not implemented, so the number here *is* the answer a client gets.
+        // about: the number here *is* the answer a client gets, and it is stated rather than chosen.
         let drsuapi_tcp = match config.drsuapi_port {
             None => None,
             Some(0) => return Err("smb.drsuapi_port is 0, which names no port".to_string()),
             Some(port) => Some(SocketAddr::new(bind_ip, port)),
         };
+        // The mapper goes with the interface it maps: one without the other is a controller whose
+        // `DsBind` answers `RPC_S_SERVER_UNAVAILABLE` to a client that found the port by guessing.
+        let epm_tcp = drsuapi_tcp.map(|_| {
+            SocketAddr::new(
+                bind_ip,
+                config.epm_port.unwrap_or(crate::smb::DEFAULT_EPM_PORT),
+            )
+        });
 
         Ok(Settings {
             bind: SocketAddr::new(bind_ip, port),
             drsuapi_tcp,
+            epm_tcp,
             netbios_name,
             keytab: config.keytab.clone(),
             users,

@@ -91,7 +91,7 @@ pub async fn start(
     }
     // The accounts a client logs on with before it has a ticket: `Add-Computer` sends NTLM, because
     // the domain it is joining has not issued it one yet.
-    if let Some(source) = logon_users {
+    if let Some(source) = logon_users.clone() {
         builder = builder.logon_users(source);
     }
     // Creating the account the join asks for: `Add-Computer` makes it over `samr`, before it has a
@@ -155,6 +155,9 @@ pub async fn start(
                 // server already holds keys for, and a second keytab would be a second answer to
                 // one question.
                 keytab: settings.keytab.clone(),
+                // And the same accounts: a Windows join authenticates this endpoint with NTLM, not
+                // with a ticket, because the domain it is joining has issued it none.
+                logon_users: logon_users.clone(),
                 // This listener is the interface itself, not the mapper: nothing is published here.
                 publish: None,
             };
@@ -197,6 +200,7 @@ pub async fn start(
                     },
                 ),
                 keytab: settings.keytab.clone(),
+                logon_users: logon_users.clone(),
                 publish: Some(smb_server::tcp::Published {
                     drsuapi_port: drsuapi_addr.port(),
                 }),

@@ -246,6 +246,36 @@ impl MachineAccounts for DirectoryAccounts {
             }
         }
     }
+
+    async fn account_of_rid(&self, rid: u32) -> Option<String> {
+        let directory = self.source.directory().await;
+        // Read through the snapshot the way `existing` does, and match on the SID rather than on the
+        // DN: a machine account may sit in any container, and its RID is the only thing the wire
+        // named. An entry whose SID this build cannot read is skipped rather than stopping the scan.
+        let found = directory.all().iter().find(|entry| {
+            entry
+                .attributes()
+                .get("objectSid")
+                .and_then(|attribute| attribute.values.first())
+                .and_then(|value| {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(value.trim())
+                        .ok()
+                })
+                .and_then(|bytes| crate::sid::Sid::from_bytes(&bytes).ok())
+                .and_then(|sid| rid_of(&sid))
+                == Some(rid)
+        })?;
+        let name = found
+            .attributes()
+            .get("sAMAccountName")?
+            .values
+            .first()?
+            .clone();
+        tracing::debug!(rid, account = %name, dn = found.dn(), "samr: a RID resolved to an account");
+        Some(name)
+    }
 }
 
 impl DirectoryAccounts {

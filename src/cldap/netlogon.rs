@@ -22,6 +22,14 @@
 use std::net::Ipv4Addr;
 
 /// LOGON_SAM_LOGON_RESPONSE_EX, for the `_EX` structure.
+/// The site every domain has until an administrator creates another.
+///
+/// A domain's site topology starts with exactly this one, so naming it is not an invention about a
+/// particular deployment - it is the one site there is. A controller that names no site at all
+/// leaves a joining client with an empty value to copy into its netlogon cache, and that step then
+/// fails with an invalid parameter after everything before it succeeded.
+pub const DEFAULT_SITE: &str = "Default-First-Site-Name";
+
 pub const LOGON_SAM_LOGON_RESPONSE_EX: u16 = 23;
 /// LOGON_SAM_PAUSE_RESPONSE_EX: the DC is not serving.
 pub const LOGON_SAM_PAUSE_RESPONSE_EX: u16 = 24;
@@ -119,9 +127,11 @@ pub struct Advertised {
     pub address: Ipv4Addr,
     /// `DcSiteName` and `ClientSiteName`.
     ///
-    /// Empty, and deliberately: this server has no sites container, so it has no site to name.
-    /// Inventing `Default-First-Site-Name` would tell a client its site is known when nothing here
-    /// knows about sites at all.
+    /// `Default-First-Site-Name`, because a domain has exactly one site until an administrator
+    /// makes another, and every controller names that one. Empty was measured to break a join: the
+    /// client copies the site it is told into its netlogon cache, and a controller that names none
+    /// leaves the client with an invalid parameter at that step (`0x57`) after every other call has
+    /// succeeded. Samba names this site, and a join against Samba completes.
     pub site: String,
     /// Whether this process issues tickets for the realm - that is, whether a KDC is serving here.
     ///

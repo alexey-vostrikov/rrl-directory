@@ -404,7 +404,7 @@ impl Settings {
                 netbios_host,
                 kdc,
                 address,
-                site: String::new(),
+                site: netlogon::DEFAULT_SITE.to_string(),
             },
         })
     }
@@ -554,7 +554,7 @@ mod tests {
             netbios_host: "DC1".to_string(),
             domain_guid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"example.com"),
             address: Ipv4Addr::new(192, 0, 2, 10),
-            site: String::new(),
+            site: crate::cldap::netlogon::DEFAULT_SITE.to_string(),
         }
     }
 

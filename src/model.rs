@@ -148,6 +148,18 @@ pub struct Attribute {
     pub value_csns: Option<Box<[Arc<str>]>>,
 }
 
+/// `attribute` under `description`, so a client that asked for `name;option` gets that name back.
+///
+/// The values are untouched: the option says how the client wants the transfer, not what the value
+/// is, and no option this server knows changes the octets it holds.
+fn renamed(attribute: &Attribute, description: &str) -> Attribute {
+    let mut out = attribute.clone();
+    if !description.eq_ignore_ascii_case(&attribute.name) {
+        out.name = attribute_name(description);
+    }
+    out
+}
+
 impl Attribute {
     /// Attribute with explicit values.
     pub fn new(name: impl AsRef<str>, values: Vec<String>) -> Self {
@@ -409,20 +421,70 @@ impl Attributes {
                 // store would be a second thing to keep in step. Measured on the AD-join stand: a
                 // Windows client reads `objectGuid` and `objectSid` on the domain and stops the join
                 // with `0x2` when either is missing.
-                _ if requested.eq_ignore_ascii_case(ATTR_OBJECT_GUID) => {
-                    if let Some(attribute) = self.object_guid() {
-                        push_unique(attribute, &mut out, &mut seen);
+                // The entry's own identity. Derived from the DN when nothing carried one, because
+                // RFC 4530 gives every entry a UUID and an entry without one is an entry a client
+                // cannot refer to - a Windows join reads `objectGuid` beside `objectSid` when it
+                // checks the account it just made, and an empty answer stops it there.
+                _ if Self::base_of(requested).eq_ignore_ascii_case(ATTR_ENTRY_UUID) => {
+                    let text = self
+                        .get(ATTR_ENTRY_UUID)
+                        .and_then(|held| held.values.first().cloned())
+                        .unwrap_or_else(|| crate::directory::entry_uuid(dn));
+                    push_unique(
+                        renamed(
+                            &Attribute::single(ATTR_ENTRY_UUID, &text).operational(),
+                            requested,
+                        ),
+                        &mut out,
+                        &mut seen,
+                    );
+                }
+                _ if Self::base_of(requested).eq_ignore_ascii_case(ATTR_OBJECT_GUID) => {
+                    // The same identity in AD's binary form, and the same fallback.
+                    let derived = match self.object_guid() {
+                        Some(carried) => Some(carried),
+                        None => {
+                            let text = self
+                                .get(ATTR_ENTRY_UUID)
+                                .and_then(|held| held.values.first().cloned())
+                                .unwrap_or_else(|| crate::directory::entry_uuid(dn));
+                            guid_octets(&text).map(|octets| {
+                                Attribute::new(ATTR_OBJECT_GUID, vec![encode_binary(&octets)])
+                                    .binary()
+                                    .operational()
+                            })
+                        }
+                    };
+                    if let Some(attribute) = derived {
+                        push_unique(renamed(&attribute, requested), &mut out, &mut seen);
                     }
                 }
                 _ => {
-                    if let Some(attribute) = self.get(requested) {
-                        push_unique(attribute.clone(), &mut out, &mut seen);
+                    // RFC 4512 §2.5: an attribute description may carry options - `objectSid;binary`
+                    // - and asking for one means the attribute, transferred in that form. Matching
+                    // the whole description against the stored names finds nothing, which reads to
+                    // the client as an attribute that is not there.
+                    //
+                    // Measured: a Windows join asks for `objectSid;binary` when it reads back the
+                    // SID of the account it just created, and stops with `0x8` when the answer is
+                    // missing it - after which it deletes the account it made.
+                    let base = Self::base_of(requested);
+                    if let Some(attribute) = self.get(base) {
+                        push_unique(renamed(attribute, requested), &mut out, &mut seen);
                     }
                 }
             }
         }
 
         out
+    }
+
+    /// The attribute description without its options (RFC 4512 §2.5).
+    ///
+    /// `objectSid;binary` and `objectSid` name the same attribute; only the form of the transfer
+    /// differs, and this server carries binary values as base64 either way.
+    pub fn base_of(description: &str) -> &str {
+        description.split(';').next().unwrap_or(description)
     }
 
     /// AD's `objectGuid` for this entry, in the octets AD puts on the wire.

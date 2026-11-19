@@ -113,6 +113,22 @@ pub async fn export(
             .get("objectSid")
             .is_some_and(|attribute| !attribute.values.is_empty())
     });
+    // Whether the stored account is shaped like one at all: a store written by an earlier build kept
+    // the realm's `krb5Principal` classes and never gained `computer`, and the write below is
+    // otherwise skipped for it on every start, so the wrong shape would stay forever. Measured: the
+    // schema reported `sAMAccountName`, `objectSid`, `dNSHostName` and `primaryGroupID` as "not
+    // allowed by any object class" for the controller's own account on every reload.
+    let shaped_like_an_account = existing.as_ref().is_some_and(|entry| {
+        entry
+            .attributes()
+            .get("objectClass")
+            .is_some_and(|attribute| {
+                attribute
+                    .values
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case("computer"))
+            })
+    });
     let (mut entry, mut created) = match existing {
         Some(entry) => (read_back(&entry, &principal)?, false),
         None => (create(&principal)?, true),
@@ -219,7 +235,7 @@ pub async fn export(
         sid_attribute = Some(base64::engine::general_purpose::STANDARD.encode(sid.to_bytes()));
     }
 
-    if created || sid_attribute.is_some() {
+    if created || sid_attribute.is_some() || !shaped_like_an_account {
         let mut entry = entry_of(&entry, dn.clone(), dns_host, dns_domain);
         if let Some(encoded) = sid_attribute {
             entry = crate::model::Entry::new(
@@ -229,6 +245,16 @@ pub async fn export(
                     .clone()
                     // Binary: the value is base64 in the store and a SID on the wire.
                     .push(crate::model::Attribute::single("objectSid", &encoded).binary()),
+            );
+        }
+        if std::env::var_os("RRL_KEYTAB_DIAG").is_some() {
+            eprintln!(
+                "keytab: writing {dn}: created={created} shaped={shaped_like_an_account} classes={:?}",
+                entry
+                    .attributes()
+                    .get("objectClass")
+                    .map(|attribute| attribute.values.clone())
+                    .unwrap_or_default()
             );
         }
         let changes = [EntryChange::Upsert { entry }];
@@ -316,7 +342,12 @@ fn entry_of(account: &HdbEntry, dn: String, dns_host: &str, dns_domain: &str) ->
     spns.dedup();
 
     let attributes: Attributes = attributes_of(account)
-        .push(Attribute::new(
+        // `replace`, not `push`: the realm's own vocabulary has already put `top` and the two
+        // `krb5*` classes here, and `push` appends a second `objectClass` beside them. Readers take
+        // the first match, so the entry kept its `krb5Principal` shape and lost the `computer` one -
+        // measured, the schema then reported `sAMAccountName`, `objectSid`, `dNSHostName` and
+        // `primaryGroupID` as "not allowed by any object class" for the controller's own account.
+        .replace(Attribute::new(
             "objectClass",
             vec![
                 "top".to_string(),

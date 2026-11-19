@@ -771,6 +771,8 @@ async fn serve() {
     // directory is built, so the first query finds it rather than a zone that appears a second
     // later.
     #[cfg(feature = "dns")]
+    let dns_published = std::sync::Arc::new(std::sync::Mutex::new(None));
+    #[cfg(feature = "dns")]
     let dns_settings = if config.dns.enabled {
         // The LDAP listener is not bound yet at this point, so the address comes from the
         // configuration that will bind it: a zone written after the bind would be a zone missing for
@@ -788,6 +790,9 @@ async fn serve() {
             Ok(settings) => settings,
             Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
         };
+        if let Ok(mut slot) = dns_published.lock() {
+            *slot = Some(settings.address);
+        }
         let facts = rrl_directory::dns::provision::Facts {
             base_dn: config.base_dn.clone(),
             dns_domain: settings.dns_domain.clone(),
@@ -1236,6 +1241,13 @@ async fn serve() {
                 #[cfg(feature = "kdc")]
                 if let Some(issuer) = &domain {
                     settings.domain_sid = Some(issuer.sid().to_bytes());
+                }
+                // The address the DNS zone publishes, which is the one a client can reach. Taken
+                // from the zone's own settings rather than from the bind address: the two are the
+                // same number only when the client runs on this host.
+                #[cfg(feature = "dns")]
+                if let Some(address) = dns_published.lock().ok().and_then(|slot| *slot) {
+                    settings.dc_address = Some(address);
                 }
                 // The domain's NetBIOS name, by AD's own rule: the realm's first label, upper
                 // case. This is the last place it can be stated explicitly; `Settings::resolve`

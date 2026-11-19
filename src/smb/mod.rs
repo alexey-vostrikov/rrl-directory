@@ -154,6 +154,12 @@ pub struct Settings {
     pub domain_netbios: Option<String>,
     /// Serve the secure channel of a client that offers no AES.
     pub netlogon_des: bool,
+    /// The address a client is told to reach this controller at, when one is configured.
+    ///
+    /// `netr_DsRGetDCNameEx2` answers with an address, and a controller that names its bind address
+    /// names one only the host itself can reach. The value comes from the daemon, which knows the
+    /// address the DNS zone publishes - the same question, answered once.
+    pub dc_address: Option<std::net::Ipv4Addr>,
 }
 
 impl Settings {
@@ -239,6 +245,8 @@ impl Settings {
 
         Ok(Settings {
             bind: SocketAddr::new(bind_ip, port),
+            // Filled by the daemon, which is where the published address is known.
+            dc_address: None,
             drsuapi_tcp,
             epm_tcp,
             netbios_name,

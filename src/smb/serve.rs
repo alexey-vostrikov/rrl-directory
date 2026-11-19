@@ -102,6 +102,11 @@ pub async fn start(
     // The DES secure channel, when the deployment asks for it: off unless `smb.netlogon_des` says
     // otherwise, because that channel's credential is two passes of a 56-bit cipher.
     builder = builder.netlogon_des(settings.netlogon_des);
+    // The address a client is told to reach: `netr_DsRGetDCNameEx2` answers with one, and the bind
+    // address is not it when the client is on another machine.
+    if let Some(address) = settings.dc_address {
+        builder = builder.dc_address(address);
+    }
 
     // Passwords, when any are configured. Taken from the resolved settings rather than from the
     // environment here, so that a missing variable was already a startup error.

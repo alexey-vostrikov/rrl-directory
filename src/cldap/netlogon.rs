@@ -56,6 +56,16 @@ pub mod flags {
     pub const DS_DNS_DOMAIN_FLAG: u32 = 0x4000_0000;
     /// The naming context is the forest root.
     pub const DS_DNS_FOREST_FLAG: u32 = 0x8000_0000;
+    /// The functional level this controller's answer is good for, as `MS-ADTS` 6.3.1.2 numbers
+    /// them: 2008 R2, 2012 R2, 2016.
+    ///
+    /// The 2016 bit is the one a member checks first, and its absence is reported as
+    /// `NetpDcMatchResponse: response not from a WinThreshold dc` - a sentence about the *level* of
+    /// a controller whose answer was otherwise complete. Measured: without it, a joined member
+    /// rejected the only controller in its domain and gave up at `1355` (`ERROR_NO_SUCH_DOMAIN`).
+    pub const DS_DS_8_FLAG: u32 = 0x0000_4000;
+    pub const DS_DS_9_FLAG: u32 = 0x0000_8000;
+    pub const DS_DS_10_FLAG: u32 = 0x0001_0000;
 }
 
 /// NETLOGON_NT_VERSION bits (`MS-ADTS` 6.3.1.1).
@@ -153,6 +163,9 @@ impl Advertised {
         let base = flags::DS_LDAP_FLAG
             | flags::DS_DS_FLAG
             | flags::DS_WRITABLE_FLAG
+            | flags::DS_DS_8_FLAG
+            | flags::DS_DS_9_FLAG
+            | flags::DS_DS_10_FLAG
             | flags::DS_DNS_CONTROLLER_FLAG
             | flags::DS_DNS_DOMAIN_FLAG
             | flags::DS_DNS_FOREST_FLAG;

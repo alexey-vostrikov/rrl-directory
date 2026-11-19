@@ -249,11 +249,16 @@ impl MachineAccounts for DirectoryAccounts {
 
     async fn account_of_rid(&self, rid: u32) -> Option<String> {
         let directory = self.source.directory().await;
-        // Read through the snapshot the way `existing` does, and match on the SID rather than on the
-        // DN: a machine account may sit in any container, and its RID is the only thing the wire
-        // named. An entry whose SID this build cannot read is skipped rather than stopping the scan.
-        let found = directory.all().iter().find(|entry| {
-            entry
+        // Matched on the SID rather than on the DN: a machine account may sit in any container, and
+        // its RID is the only thing the wire named. Read through `record`, not through the snapshot:
+        // `all()` holds skeletons for everything that existed when this process started, so a scan
+        // over it sees no `objectSid` at all and answers "no such user" for an account that is there.
+        let mut found = None;
+        for identity in directory.all() {
+            let Some(record) = directory.record(identity.dn()) else {
+                continue;
+            };
+            let entry_rid = record
                 .attributes()
                 .get("objectSid")
                 .and_then(|attribute| attribute.values.first())
@@ -264,9 +269,13 @@ impl MachineAccounts for DirectoryAccounts {
                         .ok()
                 })
                 .and_then(|bytes| crate::sid::Sid::from_bytes(&bytes).ok())
-                .and_then(|sid| rid_of(&sid))
-                == Some(rid)
-        })?;
+                .and_then(|sid| rid_of(&sid));
+            if entry_rid == Some(rid) {
+                found = Some(record.into_owned());
+                break;
+            }
+        }
+        let found = found?;
         let name = found
             .attributes()
             .get("sAMAccountName")?
@@ -282,21 +291,26 @@ impl DirectoryAccounts {
     /// The entry an account with this name already holds, if any.
     async fn existing(&self, account: &str) -> Option<crate::model::Entry> {
         let directory = self.source.directory().await;
-        directory
-            .all()
-            .iter()
-            .find(|entry| {
-                entry
-                    .attributes()
-                    .get("sAMAccountName")
-                    .is_some_and(|attribute| {
-                        attribute
-                            .values
-                            .iter()
-                            .any(|value| value.eq_ignore_ascii_case(account))
-                    })
-            })
-            .cloned()
+        // Through `record`, for the reason `account_of_rid` records: the snapshot's entries are
+        // skeletons, and a machine account that existed when this process started is one of them.
+        for identity in directory.all() {
+            let Some(record) = directory.record(identity.dn()) else {
+                continue;
+            };
+            let named = record
+                .attributes()
+                .get("sAMAccountName")
+                .is_some_and(|attribute| {
+                    attribute
+                        .values
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case(account))
+                });
+            if named {
+                return Some(record.into_owned());
+            }
+        }
+        None
     }
 }
 

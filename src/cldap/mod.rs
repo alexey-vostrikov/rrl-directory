@@ -512,6 +512,17 @@ pub async fn serve(
                 refuse(ping.message_id)
             }
             _ => {
+                // Under `RRL_CLDAP_DIAG`: a client that rejects the answer names no field, and the
+                // ping it sent is the only place the field exists.
+                if std::env::var_os("RRL_CLDAP_DIAG").is_some() {
+                    tracing::warn!(
+                        nt_version = format_args!("{:#010x}", ping.nt_version),
+                        dns_domain = ?ping.dns_domain,
+                        user = ?ping.user,
+                        account_control = ?ping.account_control,
+                        "cldap: ping"
+                    );
+                }
                 let directory = source.directory().await;
                 let base = directory.base_dn().to_string();
                 let reply = answer(&ping, &settings.advertised, |user| {
@@ -538,14 +549,29 @@ pub async fn serve(
 /// candidate attributes and a scan of the store for each ping would be a denial of service with
 /// extra steps.
 fn user_exists(directory: &crate::directory::Directory, _base: &str, user: &str) -> bool {
-    directory.find(&format!("uid={user}")).is_some()
-        || directory.all().iter().any(|entry| {
-            entry
-                .attributes()
-                .get("sAMAccountName")
-                .and_then(|attribute| attribute.values.first())
-                .is_some_and(|value| value.eq_ignore_ascii_case(user))
-        })
+    if directory.find(&format!("uid={user}")).is_some() {
+        return true;
+    }
+    // Read through `record`, not through `all()`: a snapshot taken at start holds *skeletons* - a DN
+    // and the indexed attributes, with the record a read away - so a scan over `all()` sees an empty
+    // attribute list for every entry that existed before this process started. Measured: a member
+    // that pinged its own machine account was told the account does not exist, the client answered
+    // `NetpDcMatchResponse: response for wrong account '(null)' s.b. 'DOCKERW-K5E4442$'` and
+    // rejected the controller - `NetpDcGetNameIp: Couldn't ping any DCs`, `1355`.
+    for identity in directory.all() {
+        let Some(record) = directory.record(identity.dn()) else {
+            continue;
+        };
+        if record
+            .attributes()
+            .get("sAMAccountName")
+            .and_then(|attribute| attribute.values.first())
+            .is_some_and(|value| value.eq_ignore_ascii_case(user))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

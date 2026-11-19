@@ -21,6 +21,16 @@ pub fn ldap_result(code: ResultCode, diagnostic: &str) -> LdapResult {
 }
 
 pub fn bind_response(message_id: MessageId, code: ResultCode, diagnostic: &str) -> LdapMessage {
+    // Every refused bind, under `RRL_BIND_DIAG`: a client that reports only "49" leaves the server's
+    // own reason as the one place the answer exists, and a bind that fails as a machine account is
+    // indistinguishable from one that fails on a typo without it.
+    if code != ResultCode::Success && std::env::var_os("RRL_BIND_DIAG").is_some() {
+        tracing::warn!(
+            code = ?code,
+            diagnostic,
+            "ldap: bind refused"
+        );
+    }
     LdapMessage::new(
         message_id,
         ProtocolOp::BindResponse(BindResponse::new(

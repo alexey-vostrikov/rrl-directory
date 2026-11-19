@@ -138,7 +138,9 @@ pub fn entries(facts: &Facts) -> Option<Vec<Entry>> {
             .collect();
         // The `_msdcs` owner names are spelled with the domain appended, and their node's `dc`
         // attribute is the whole relative name, dots and all - AD does the same.
-        let relative = owner.replace("%domain%", &facts.dns_domain);
+        let relative = owner
+            .replace("%domain%", &facts.dns_domain)
+            .replace("%site%", SITE);
         out.push(zone::node_entry(&zone_dn, &relative, &records).ok()?);
     }
 
@@ -160,7 +162,25 @@ const LOCATORS: &[(&str, &[(u16, ())])] = &[
     ("_kpasswd._tcp", &[(464, ())]),
     ("_kpasswd._udp", &[(464, ())]),
     ("_gc._tcp", &[(3268, ())]),
+    // The site-scoped spelling of the same locators, and the one a client asks for *first*: a
+    // member of the domain knows its site, so it looks for a controller in that site before it
+    // falls back to the whole domain. A zone without these answers `NXDOMAIN` to the first
+    // question a member asks, and Windows reports that as no such domain (`0x54b`) - measured,
+    // after a join that had completed.
+    ("_ldap._tcp.%site%._sites", &[(389, ())]),
+    ("_ldap._tcp.%site%._sites.dc._msdcs", &[(389, ())]),
+    ("_kerberos._tcp.%site%._sites", &[(88, ())]),
+    ("_kerberos._tcp.%site%._sites.dc._msdcs", &[(88, ())]),
+    ("_gc._tcp.%site%._sites", &[(3268, ())]),
+    // The PDC emulator locator: this server is the only controller, so it is that too.
+    ("_ldap._tcp.pdc._msdcs", &[(389, ())]),
 ];
+
+/// The site the locators are published for.
+///
+/// Same value the controller names in its CLDAP ping: a domain has one site until an administrator
+/// makes another, and a client matches the two against each other.
+const SITE: &str = "default-first-site-name";
 
 /// Writes the zone into the store, and reports the DNs it created.
 ///

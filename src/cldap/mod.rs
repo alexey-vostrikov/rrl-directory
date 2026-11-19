@@ -497,8 +497,17 @@ pub async fn serve(
         // A domain this server does not hold is answered with an empty result rather than with a
         // Netlogon structure: the client learns this address is not its controller and moves on,
         // instead of adopting it and failing at the next step.
+        // A name the client sends may be written absolute (`ad.example.com.`) or as the NetBIOS name
+        // of the same domain; neither is a different domain. Comparing the text as it arrived was
+        // measured to refuse a member of this very domain, which then reported that the domain does
+        // not exist.
+        let holds = |domain: &str| {
+            let asked = domain.trim_end_matches('.');
+            asked.eq_ignore_ascii_case(&settings.advertised.dns_domain)
+                || asked.eq_ignore_ascii_case(&settings.advertised.netbios_domain)
+        };
         let reply = match &ping.dns_domain {
-            Some(domain) if !domain.eq_ignore_ascii_case(&settings.advertised.dns_domain) => {
+            Some(domain) if !holds(domain) => {
                 metrics.cldap_refused("a domain this server does not hold");
                 refuse(ping.message_id)
             }

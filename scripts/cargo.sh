@@ -43,8 +43,17 @@ esac
 # MIRIFLAGS is passed through because otherwise `-Zmiri-disable-isolation` is dropped silently, and
 # a test that needs the filesystem fails with "mkdir not available when isolation is enabled" - which
 # reads as a defect in the code under test rather than in the harness.
+# Temporary: a sibling checkout, so a change under test can be built before it is pushed.
+extra_mounts=""
+if [ -n "${RR_LDAP_EXTRA_MOUNT:-}" ]; then
+    for mount in $RR_LDAP_EXTRA_MOUNT; do
+        extra_mounts="$extra_mounts -v $mount"
+    done
+fi
+
 exec docker run --rm \
   -v "$repo:/w" \
+  ${extra_mounts} \
   -v "$cargo_cache:/cargo" \
   -v "$target_cache:/target" \
   -w /w \

@@ -227,7 +227,8 @@ pub async fn export(
                 entry
                     .attributes()
                     .clone()
-                    .push(crate::model::Attribute::single("objectSid", &encoded)),
+                    // Binary: the value is base64 in the store and a SID on the wire.
+                    .push(crate::model::Attribute::single("objectSid", &encoded).binary()),
             );
         }
         let changes = [EntryChange::Upsert { entry }];

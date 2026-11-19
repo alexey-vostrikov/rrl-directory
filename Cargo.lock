@@ -1548,7 +1548,6 @@ dependencies = [
 [[package]]
 name = "krb5"
 version = "1.0.0"
-source = "git+https://github.com/alexey-vostrikov/krb5?branch=main#84d98fa31ab1307e7e4b25566fbba41143b28577"
 dependencies = [
  "aes 0.9.4",
  "chrono",
@@ -2737,7 +2736,6 @@ checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 [[package]]
 name = "smb-server"
 version = "0.9.1"
-source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=krb5-support#66b9d62c495a63804580e7e8c9d87182fe94c299"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",

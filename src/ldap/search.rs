@@ -605,6 +605,25 @@ pub fn handle_search(
                     .read
             })
             .collect();
+        if std::env::var_os("RRL_LDAP_DIAG").is_some()
+            && dn.to_ascii_lowercase().contains("dockerw")
+        {
+            tracing::warn!(
+                dn = dn.as_str(),
+                selection = ?selection,
+                returned = ?visible
+                    .iter()
+                    .map(|a| format!(
+                        "{}({}){:?}",
+                        a.name,
+                        a.values.len(),
+                        a.values.first().map(|v| v.chars().take(48).collect::<String>())
+                    ))
+                    .collect::<Vec<_>>(),
+                binary = ?visible.iter().map(|a| a.flags.binary).collect::<Vec<_>>(),
+                "ldap: what this search returns"
+            );
+        }
         let selected = if request.types_only {
             visible.into_iter().map(without_values).collect()
         } else {

@@ -138,10 +138,11 @@ impl MachineAccounts for DirectoryAccounts {
                 "primaryGroupID",
                 &DOMAIN_COMPUTERS_RID.to_string(),
             ))
-            .push(crate::model::Attribute::single(
-                "objectSid",
-                &Self::encode_sid(&sid),
-            ));
+            // Marked binary: `objectSid`'s syntax is a SID, so its value leaves as octets. Without
+            // the flag the store's base64 text goes on the wire and a client that parses it as a
+            // SID fails - measured, a Windows join's `ConvertSidToStringSid` on the account it had
+            // just created.
+            .push(crate::model::Attribute::single("objectSid", &Self::encode_sid(&sid)).binary());
 
         if let Some(domain) = self.dns_domain.as_deref() {
             // The four names `net ads join` derives from a machine's own name. A member searches for

@@ -1041,7 +1041,13 @@ impl Source {
         entry: &crate::model::Entry,
         attributes: &crate::model::Attributes,
     ) -> Option<crate::sid::Sid> {
-        let issuer = self.sid_issuer.get()?;
+        let Some(issuer) = self.sid_issuer.get() else {
+            tracing::debug!(
+                dn = entry.dn(),
+                "ad: no SID issuer, so no SID for this entry"
+            );
+            return None;
+        };
         if attributes.get("objectSid").is_some() {
             return None;
         }
@@ -1051,6 +1057,11 @@ impl Source {
             .iter()
             .any(|class| crate::ad_vocabulary::has_auxiliary(class, "securityPrincipal"));
         if !is_principal {
+            tracing::debug!(
+                dn = entry.dn(),
+                classes = ?classes.values,
+                "ad: not a security principal, so no SID"
+            );
             return None;
         }
         match issuer.take() {

@@ -146,3 +146,9 @@ tower = { version = "0.5.3", features = ["util"] }
 # meant to be offered upstream and dropped once a release carries them.
 [patch.crates-io]
 rasn-ldap = { path = "vendor/rasn-ldap" }
+
+[patch."https://github.com/alexey-vostrikov/rrl-smb"]
+smb-server = { path = "/sibling/rrl-smb" }
+
+[patch."https://github.com/alexey-vostrikov/krb5"]
+krb5 = { path = "/sibling/rrl-krb5" }

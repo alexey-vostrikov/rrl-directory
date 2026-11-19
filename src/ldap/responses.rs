@@ -93,7 +93,13 @@ pub fn search_result_entry_with_controls(
                             // directory is read by clients that act on absence. Nothing this server
                             // writes can produce that state - the writers encode - so the fallback
                             // is for a store somebody else edited.
-                            let bytes = if attribute.flags.binary {
+                            // The flag is what a writer sets; an attribute whose syntax is binary
+                            // leaves as octets whether or not every writer remembered. A SID in
+                            // base64 text on the wire is a SID the client cannot parse, and the
+                            // one place that can happen is a writer that forgot the flag.
+                            let bytes = if attribute.flags.binary
+                                || crate::model::is_always_binary(&attribute.name)
+                            {
                                 decode_binary(value).unwrap_or_else(|| value.as_bytes().to_vec())
                             } else {
                                 value.as_bytes().to_vec()

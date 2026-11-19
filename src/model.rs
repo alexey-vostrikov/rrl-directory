@@ -148,14 +148,46 @@ pub struct Attribute {
     pub value_csns: Option<Box<[Arc<str>]>>,
 }
 
+/// Attributes whose stored form is base64 and whose wire form is always octets.
+///
+/// Their schema syntax makes the choice for them - a SID, a GUID, a security descriptor are not
+/// text - so the encoder can decide without reaching for the schema and without trusting each
+/// writer to have set the flag. Measured: a machine account written without the flag sent its SID
+/// as base64 text, and a Windows join's `ConvertSidToStringSid` failed on it.
+pub fn is_always_binary(name: &str) -> bool {
+    const ALWAYS: [&str; 4] = [
+        "objectsid",
+        "objectguid",
+        "ntsecuritydescriptor",
+        "unicodepwd",
+    ];
+    let base = base_of(name).to_ascii_lowercase();
+    ALWAYS.contains(&base.as_str())
+}
+
+/// The attribute description without its options (RFC 4512 §2.5).
+///
+/// `objectSid;binary` and `objectSid` name the same attribute: the option says how the client wants
+/// the value transferred, not which attribute it is. This server carries binary values as base64 in
+/// the store and as octets on the wire either way, so the option changes nothing it computes.
+pub fn base_of(description: &str) -> &str {
+    description.split(';').next().unwrap_or(description)
+}
+
 /// `attribute` under `description`, so a client that asked for `name;option` gets that name back.
 ///
 /// The values are untouched: the option says how the client wants the transfer, not what the value
 /// is, and no option this server knows changes the octets it holds.
 fn renamed(attribute: &Attribute, description: &str) -> Attribute {
     let mut out = attribute.clone();
-    if !description.eq_ignore_ascii_case(&attribute.name) {
-        out.name = attribute_name(description);
+    // The name is the attribute's own, without the option the client asked with. AD answers
+    // `objectSid` to a request for `objectSid;binary` - measured, and the reason a join failed:
+    // a client that reads the SID back matches the name it knows, and an answer carrying
+    // `objectSid;binary` is one it cannot find, leaving it with no bytes to hand to
+    // `ConvertSidToStringSid`.
+    let base = base_of(description);
+    if !base.eq_ignore_ascii_case(&attribute.name) {
+        out.name = attribute_name(base);
     }
     out
 }
@@ -480,11 +512,8 @@ impl Attributes {
     }
 
     /// The attribute description without its options (RFC 4512 §2.5).
-    ///
-    /// `objectSid;binary` and `objectSid` name the same attribute; only the form of the transfer
-    /// differs, and this server carries binary values as base64 either way.
     pub fn base_of(description: &str) -> &str {
-        description.split(';').next().unwrap_or(description)
+        base_of(description)
     }
 
     /// AD's `objectGuid` for this entry, in the octets AD puts on the wire.

@@ -18,6 +18,8 @@ pub struct Running {
     pub netbios_name: String,
     /// Where `drsuapi` answers over `ncacn_ip_tcp`, and the task serving it.
     pub drsuapi: Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>,
+    /// Where `netlogon` answers over `ncacn_ip_tcp`, and the task serving it.
+    pub netlogon: Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>,
     /// Where the endpoint mapper answers, and the task serving it.
     pub epm: Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>,
     /// Stops the accept loop and closes each connection.
@@ -44,6 +46,17 @@ impl Running {
     /// domain controller that stopped answering.
     pub async fn stop(self) {
         self.shutdown.shutdown();
+        // The extra listeners hold their own tasks: a daemon that returns while one of them still
+        // accepts leaves a port open for the next start to fail on.
+        if let Some((_, task)) = self.drsuapi {
+            task.abort();
+        }
+        if let Some((_, task)) = self.netlogon {
+            task.abort();
+        }
+        if let Some((_, task)) = self.epm {
+            task.abort();
+        }
         let _ = self.task.await;
     }
 }
@@ -169,11 +182,9 @@ pub async fn start(
                 logon_users: logon_users.clone(),
                 // This listener is the interface itself, not the mapper: nothing is published here.
                 publish: None,
-                // The secure channel a joined member proves against. Windows looks for `netlogon`
-                // through the mapper and calls it over this transport, so an endpoint that names the
-                // interface without answering it leaves the member reporting that no logon server
-                // is available for a domain it belongs to.
-                channel_state: Some(smb_server::tcp::ChannelState(channel_state.clone())),
+                // `netlogon` is not here: it answers on the port below, because a client that finds
+                // two interfaces on one port uses neither over TCP.
+                channel_state: None,
             };
             // A listener that cannot be taken is a startup failure naming the address, which is what
             // an operator can act on; the port is released again immediately, because the task
@@ -188,6 +199,50 @@ pub async fn start(
             });
             Some((addr, task))
         }
+    };
+
+    // `netlogon` on its own port, the one the mapper publishes for it. A Windows member asks the
+    // mapper where the secure channel lives and calls it there; announced on the `drsuapi` port
+    // instead, the tower is one the client does not use - measured, it built its channel over the
+    // named pipe and then refused it at `NlConfirmCapabilities` with no reason in its report.
+    let netlogon = match (settings.netlogon_tcp, settings.drsuapi_tcp) {
+        (Some(addr), Some(_)) => {
+            let endpoint = smb_server::tcp::Endpoint {
+                addr,
+                nb_domain: settings
+                    .domain_netbios
+                    .clone()
+                    .unwrap_or_else(|| settings.netbios_name.clone()),
+                dns_domain: settings.dns_domain.clone().unwrap_or_default(),
+                nb_computer: settings.netbios_name.clone(),
+                dns_computer: settings.dns_domain.as_deref().map_or_else(
+                    || settings.netbios_name.clone(),
+                    |domain| {
+                        format!(
+                            "{}.{}",
+                            settings.netbios_name.to_ascii_lowercase(),
+                            domain.to_ascii_lowercase()
+                        )
+                    },
+                ),
+                keytab: settings.keytab.clone(),
+                logon_users: logon_users.clone(),
+                publish: None,
+                // The whole reason this listener exists: the challenge-and-credential machinery of
+                // a machine's secure channel, on the transport a member actually uses.
+                channel_state: Some(smb_server::tcp::ChannelState(channel_state.clone())),
+            };
+            std::net::TcpListener::bind(endpoint.addr)
+                .and_then(|probe| probe.set_nonblocking(true))
+                .map_err(|err| format!("netlogon on {}: {err}", endpoint.addr))?;
+            let task = tokio::spawn(async move {
+                if let Err(err) = smb_server::tcp::serve(endpoint).await {
+                    eprintln!("netlogon: {err}");
+                }
+            });
+            Some((addr, task))
+        }
+        _ => None,
     };
 
     // The endpoint mapper, on the same address family: it is what tells a client which port the
@@ -217,6 +272,12 @@ pub async fn start(
                 logon_users: logon_users.clone(),
                 publish: Some(smb_server::tcp::Published {
                     drsuapi_port: drsuapi_addr.port(),
+                    // The secure channel answers on its own port, as it does on a real controller:
+                    // two interfaces announced on one port is a tower the client does not use.
+                    netlogon_port: settings
+                        .netlogon_tcp
+                        .map(|addr| addr.port())
+                        .unwrap_or(drsuapi_addr.port() + 1),
                 }),
                 // The mapper names where an interface lives and does not answer for it: every
                 // interface it publishes lives on the `drsuapi` port above, and that listener is the
@@ -245,6 +306,7 @@ pub async fn start(
         bind,
         netbios_name: settings.netbios_name.clone(),
         drsuapi,
+        netlogon,
         epm,
         shutdown,
         task,

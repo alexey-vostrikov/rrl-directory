@@ -75,6 +75,17 @@ pub struct SmbConfig {
     /// stated here rather than picked at start for the same reason a real controller states nothing
     /// in a file: it is published, and a client reads it from the mapper instead of guessing.
     pub drsuapi_port: Option<u16>,
+    /// The `ncacn_ip_tcp` port `netlogon` is served on.
+    ///
+    /// A port of its own, beside the `drsuapi` one, because that is where a client looks for it: a
+    /// controller that names the secure channel on the port another interface already answers on
+    /// leaves the tower one the client does not use, and the channel it then builds over the named
+    /// pipe is one it refuses afterwards. Measured against Samba, which separates the two
+    /// (`49153` for `netlogon`, `49152` for `drsuapi`).
+    ///
+    /// Defaults to `drsuapi_port + 1` when that is free and the stated port when it is not - the
+    /// configuration may state either, and the pair is what the mapper publishes.
+    pub netlogon_port: Option<u16>,
     /// The `ncacn_ip_tcp` port the endpoint mapper listens on, 135 unless stated.
     ///
     /// The mapper is how a client learns the port above: it asks here, with the interface id it
@@ -154,6 +165,8 @@ pub struct Settings {
     pub domain_netbios: Option<String>,
     /// Serve the secure channel of a client that offers no AES.
     pub netlogon_des: bool,
+    /// The port the `netlogon` endpoint answers on, beside `drsuapi_tcp`.
+    pub netlogon_tcp: Option<SocketAddr>,
     /// The address a client is told to reach this controller at, when one is configured.
     ///
     /// `netr_DsRGetDCNameEx2` answers with an address, and a controller that names its bind address
@@ -234,6 +247,24 @@ impl Settings {
             Some(0) => return Err("smb.drsuapi_port is 0, which names no port".to_string()),
             Some(port) => Some(SocketAddr::new(bind_ip, port)),
         };
+        // `netlogon` beside `drsuapi`, never on top of it: a client that finds two interfaces on one
+        // port uses neither over TCP and falls back to the named pipe. Stated, or one above the
+        // `drsuapi` port - a number the client is told, not one it guesses.
+        let netlogon_tcp = match (drsuapi_tcp, config.netlogon_port) {
+            (None, _) => None,
+            (Some(_), Some(0)) => {
+                return Err("smb.netlogon_port is 0, which names no port".to_string());
+            }
+            (Some(drsuapi), Some(port)) if drsuapi.port() == port => {
+                return Err(format!(
+                    "smb.netlogon_port is {port}, the port drsuapi answers on: the secure channel \
+                     needs a port of its own"
+                ));
+            }
+            (Some(drsuapi), Some(port)) => Some(SocketAddr::new(drsuapi.ip(), port)),
+            (Some(drsuapi), None) => Some(SocketAddr::new(drsuapi.ip(), drsuapi.port() + 1)),
+        };
+
         // The mapper goes with the interface it maps: one without the other is a controller whose
         // `DsBind` answers `RPC_S_SERVER_UNAVAILABLE` to a client that found the port by guessing.
         let epm_tcp = drsuapi_tcp.map(|_| {
@@ -248,6 +279,7 @@ impl Settings {
             // Filled by the daemon, which is where the published address is known.
             dc_address: None,
             drsuapi_tcp,
+            netlogon_tcp,
             epm_tcp,
             netbios_name,
             keytab: config.keytab.clone(),

@@ -379,7 +379,13 @@ pub fn merge_keys(into: &Attributes, derived: &Attributes) -> Attributes {
     let mut attributes = into.clone();
     for name in KEPT {
         if let Some(attribute) = derived.get(name) {
-            attributes = attributes.push(attribute.clone());
+            // Replaced, not pushed. `push` appends, so an entry that already carried this attribute
+            // ended up with two - the old value first - and every reader takes the first match. A
+            // password change then derived the right keys, logged the right hash, stored them
+            // second, and authenticated against the password the account had before it: measured,
+            // a machine account whose `unicodePwd` this server had just written answered the secure
+            // channel with the NT hash it held an hour earlier.
+            attributes = attributes.replace(attribute.clone());
         }
     }
     attributes.without("unicodePwd")

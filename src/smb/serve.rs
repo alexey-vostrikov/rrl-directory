@@ -120,6 +120,10 @@ pub async fn start(
         .await
         .map_err(|err| format!("smb '{}': {err}", settings.bind))?;
     let shutdown = server.shutdown_handle();
+    // Taken before the accept loop consumes the server: the `netlogon` endpoint below answers the
+    // same machine channels SMB does, and a channel opened over one transport has to be the channel
+    // the other knows about.
+    let channel_state = server.state();
 
     let task = tokio::spawn(async move {
         if let Err(err) = server.serve().await {
@@ -160,6 +164,11 @@ pub async fn start(
                 logon_users: logon_users.clone(),
                 // This listener is the interface itself, not the mapper: nothing is published here.
                 publish: None,
+                // The secure channel a joined member proves against. Windows looks for `netlogon`
+                // through the mapper and calls it over this transport, so an endpoint that names the
+                // interface without answering it leaves the member reporting that no logon server
+                // is available for a domain it belongs to.
+                channel_state: Some(smb_server::tcp::ChannelState(channel_state.clone())),
             };
             // A listener that cannot be taken is a startup failure naming the address, which is what
             // an operator can act on; the port is released again immediately, because the task
@@ -204,6 +213,10 @@ pub async fn start(
                 publish: Some(smb_server::tcp::Published {
                     drsuapi_port: drsuapi_addr.port(),
                 }),
+                // The mapper names where an interface lives and does not answer for it: every
+                // interface it publishes lives on the `drsuapi` port above, and that listener is the
+                // one that answers a secure channel.
+                channel_state: None,
             };
             std::net::TcpListener::bind(endpoint.addr)
                 .and_then(|probe| probe.set_nonblocking(true))

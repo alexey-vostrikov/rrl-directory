@@ -67,6 +67,27 @@ fn decode(value: &str) -> Option<Password> {
     if value.is_empty() {
         return None;
     }
+    // A value whose octets were read as text: the store holds a string, and a password that is
+    // UTF-16LE arrives as one character per octet, the zero high halves included. Read as text,
+    // `"K\0n\0o\0…"` neither starts nor ends with a quote as far as `strip_suffix` can see, so it
+    // fell through to the 8-bit branch and the password was hashed as those characters re-encoded
+    // to UTF-16 - twice the octets, and a hash no client can produce. Measured: a machine account
+    // whose password this server set answered `netr_ServerAuthenticate3` with
+    // `ERROR_ACCESS_DENIED` for the password it had just been given.
+    if value.contains('\u{0}') {
+        // Every character has to be one octet's worth: a value that lost octets on the way into the
+        // store is not a password this can recover, and guessing at it would store a hash nobody
+        // can authenticate against.
+        let mut octets = Vec::with_capacity(value.len());
+        for unit in value.chars() {
+            let value = u32::from(unit);
+            if value > 0xFF {
+                return None;
+            }
+            octets.push(value as u8);
+        }
+        return from_octets(&octets);
+    }
     // A quoted value is the wire form kept as text: the quotes are part of it, the password is not.
     if let Some(quoted) = value.strip_prefix('"') {
         let text = quoted.strip_suffix('"').unwrap_or(quoted);
@@ -80,13 +101,36 @@ fn decode(value: &str) -> Option<Password> {
         return Some(Password::from_text(value)).filter(|password| !password.text.is_empty());
     };
 
-    if looks_utf16(&octets) {
+    from_octets(&octets)
+}
+
+/// The password in one run of octets, however they were spelled before they got here.
+fn from_octets(octets: &[u8]) -> Option<Password> {
+    // Before the general test: a narrow-quoted value is the one shape the general test cannot see.
+    if let Some(body) = quoted_utf16_with_narrow_quotes(octets) {
+        let units: Vec<u16> = body
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        let text = match String::from_utf16(&units) {
+            Ok(text) => text,
+            Err(_) => String::from_utf16_lossy(&units),
+        };
+        return Some(Password {
+            text,
+            utf16: body.to_vec(),
+        })
+        .filter(|password| !password.text.is_empty());
+    }
+    if looks_utf16(octets) {
         // The quotes are code units here, and taking them off the octets is the only way the hash
         // input stays byte-for-byte what the client sent.
         let body = octets
             .strip_prefix(&[b'"', 0])
             .and_then(|rest| rest.strip_suffix(&[b'"', 0]))
-            .unwrap_or(&octets);
+            .unwrap_or(octets);
         let units: Vec<u16> = body
             .as_chunks::<2>()
             .0
@@ -108,7 +152,7 @@ fn decode(value: &str) -> Option<Password> {
     }
 
     // Not UTF-16: the octets are the password in an 8-bit encoding, quoted the same way.
-    let text = std::str::from_utf8(&octets).ok()?;
+    let text = std::str::from_utf8(octets).ok()?;
     let text = text.strip_prefix('"').unwrap_or(text);
     let text = text.strip_suffix('"').unwrap_or(text);
     Some(Password::from_text(text)).filter(|password| !password.text.is_empty())
@@ -124,6 +168,25 @@ fn looks_utf16(octets: &[u8]) -> bool {
         && octets.len().is_multiple_of(2)
         && (octets.starts_with(&[b'"', 0])
             || octets.iter().skip(1).step_by(2).all(|&high| high == 0))
+}
+
+/// Whether the octets are a *quoted* UTF-16LE password whose quotes are one octet wide.
+///
+/// Real clients send `22 00 … 22 00`, and then the plain UTF-16 test sees the quotes as code units
+/// itself. A writer that builds the value as `"` + UTF-16LE + `"` puts single octets around it
+/// instead, and that shifts every following octet by one: the zero halves stop landing on odd
+/// indices, the value stops looking like UTF-16 at all, and it is then hashed as text - twice the
+/// octets and a hash no client can produce. Measured on the join stand: an account whose password
+/// this server accepted answered the secure channel with `ERROR_ACCESS_DENIED`.
+fn quoted_utf16_with_narrow_quotes(octets: &[u8]) -> Option<&[u8]> {
+    let body = octets.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+    if body.len() < 2
+        || !body.len().is_multiple_of(2)
+        || !body.iter().skip(1).step_by(2).all(|&high| high == 0)
+    {
+        return None;
+    }
+    Some(body)
 }
 
 /// Base64, when the text is a value that `base64` wrote.

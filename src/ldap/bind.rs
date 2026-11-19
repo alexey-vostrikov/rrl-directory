@@ -219,10 +219,25 @@ fn authenticate(
         }
     };
 
-    // Only entries under the users organizational unit are accounts. gorestldap
-    // behaved the same way; here the rule is explicit instead of a side effect of
-    // the data shape, so a group or the domain entry never answers a bind.
-    if !bind_dn.ends_with(&format!(",{}", directory.ou_dn(directory.users_ou_name()))) {
+    // An account is an entry the directory names one: `sAMAccountName`. The rule used to be "under
+    // the users organizational unit", which excluded every machine account - they live in the
+    // computers container - and a member's own bind as SYSTEM is one of them.
+    let named = entry
+        .attributes()
+        .get("sAMAccountName")
+        .and_then(|attribute| attribute.values.first())
+        .is_some();
+    let carries_password = entry
+        .attributes()
+        .get("userPassword")
+        .and_then(|attribute| attribute.values.first())
+        .is_some();
+    // The users organizational unit keeps answering `InvalidCredentials` for an entry that holds no
+    // password: that entry is an account by position and the client's mistake is the password. Any
+    // other entry binds only if it is one the directory names or one that carries a password.
+    let under_users =
+        bind_dn.ends_with(&format!(",{}", directory.ou_dn(directory.users_ou_name())));
+    if !under_users && !named && !carries_password {
         return bind_response(
             message_id,
             ResultCode::NoSuchObject,
@@ -230,20 +245,12 @@ fn authenticate(
         );
     }
 
-    let stored_hash = match entry
+    let stored_hash = entry
         .attributes()
         .get("userPassword")
         .and_then(|attribute| attribute.values.first())
-    {
-        Some(hash) if !hash.is_empty() => hash.clone(),
-        _ => {
-            return bind_response(
-                message_id,
-                ResultCode::InvalidCredentials,
-                "user has no password set",
-            );
-        }
-    };
+        .filter(|hash| !hash.is_empty())
+        .cloned();
 
     let is_admin = entry.is_admin();
     let rights = security.acl.rights(
@@ -259,6 +266,50 @@ fn authenticate(
             "access rules do not allow this entry to bind",
         );
     }
+
+    // No text password: a machine account, whose password exists only as the keys derived from it -
+    // a join writes `unicodePwd` and that write leaves keys and an NT hash behind and nothing to
+    // compare text against. Verified by deriving again from the salt the entry carries; measured, a
+    // member's LDAP bind as SYSTEM answered `49: Invalid Credentials` for a password both sides
+    // agreed on, and the step that needed it then reported the domain unreachable.
+    let Some(stored_hash) = stored_hash else {
+        #[cfg(feature = "kdc")]
+        {
+            let realm = security
+                .gssapi
+                .as_ref()
+                .and_then(|gssapi| gssapi.realms().next());
+            // An entry with no keys was never given a password: the answer is about the account, not
+            // about the password, and the two read differently to whoever is looking at a log.
+            if entry
+                .attributes()
+                .internal(rrl_kdc::hdb::ldap::attrs::KEY)
+                .is_none()
+                || realm.is_none()
+            {
+                return bind_response(
+                    message_id,
+                    ResultCode::InvalidCredentials,
+                    "user has no password set",
+                );
+            }
+            let derived = realm.is_some_and(|realm| {
+                crate::kerberos::unicode_pwd::verify_password(entry.attributes(), &password, realm)
+            });
+            return if derived {
+                session.set_identity(Identity::new(&bind_dn, is_admin));
+                bind_response(message_id, ResultCode::Success, "")
+            } else {
+                bind_response(message_id, ResultCode::InvalidCredentials, "wrong password")
+            };
+        }
+        #[cfg(not(feature = "kdc"))]
+        return bind_response(
+            message_id,
+            ResultCode::InvalidCredentials,
+            "user has no password set",
+        );
+    };
 
     match verify(&password, &stored_hash, &security.passwords) {
         Ok(true) => {

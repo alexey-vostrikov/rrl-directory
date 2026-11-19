@@ -391,6 +391,41 @@ pub fn merge_keys(into: &Attributes, derived: &Attributes) -> Attributes {
     attributes.without("unicodePwd")
 }
 
+/// Whether `password` is the one this entry's keys were derived from.
+///
+/// A machine account carries no `userPassword`: a join writes `unicodePwd`, and that write leaves the
+/// entry with keys and an NT hash and no text password behind. A simple bind as such an account
+/// therefore has nothing to compare against - measured, a Windows member's own LDAP bind as SYSTEM
+/// answered `49: Invalid Credentials` for a password both sides agreed on, and the step that needed
+/// it reported the domain unreachable.
+///
+/// This is the comparison that does exist: derive the keys exactly the way the write did, and see
+/// whether the entry holds one of them. The salt comes from the entry, so a password that derives
+/// nothing in common with what is stored is a wrong password and not a wrong derivation.
+pub fn verify_password(attributes: &Attributes, password: &str, realm: &str) -> bool {
+    let Some(principal) = account_name(attributes) else {
+        return false;
+    };
+    let Ok(derived) = derive(
+        &Password::from_text(password),
+        &principal,
+        realm,
+        host_name(attributes),
+    ) else {
+        return false;
+    };
+    let key = rrl_kdc::hdb::ldap::attrs::KEY;
+    let (Some(stored), Some(candidate)) = (attributes.internal(key), derived.get(key)) else {
+        return false;
+    };
+    // Any one key in common proves it: every key in the derivation comes from the same password, and
+    // a password that produces one of the stored keys produces them all.
+    candidate
+        .values
+        .iter()
+        .any(|value| stored.values.iter().any(|held| held == value))
+}
+
 /// The entry with its keys derived from a password it carries, or unchanged.
 ///
 /// Called where a write is turned into changes, so the entry that reaches the store is already

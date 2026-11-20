@@ -7,13 +7,11 @@
 
 use std::sync::Arc;
 
+use crate::reload::Source;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, head, post};
-use subtle::ConstantTimeEq;
-
-use crate::reload::Source;
 
 /// Shared state of the HTTP surface.
 pub struct HttpState {
@@ -166,7 +164,9 @@ fn token_matches(headers: &HeaderMap, expected: &str) -> bool {
         .or_else(|| value.strip_prefix("Bearer "))
         .unwrap_or(value);
 
-    provided.len() == expected.len() && bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
+    // RRL-7.6: the crypto layer's comparison, so the family does not hold two answers to "how do we
+    // compare a secret" - this file had `subtle` while the rest of the tree had its own loop.
+    provided.len() == expected.len() && rrl_crypto::ct_eq(provided.as_bytes(), expected.as_bytes())
 }
 
 #[cfg(test)]

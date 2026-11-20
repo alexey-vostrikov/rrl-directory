@@ -33,8 +33,6 @@
 //! memory: the magic constants are the whole of the difference between the two directions, and a
 //! signer that used the wrong one would verify nothing.
 
-use hmac::{Hmac, Mac};
-use md5::{Digest, Md5};
 use rc4::{KeyInit, Rc4, StreamCipher};
 
 /// `SIGNKEY`: the key a signature is computed with, per direction ([MS-NLMP] 3.4.5.2).
@@ -225,11 +223,8 @@ impl NtlmLayer {
     }
 
     fn checksum_at(&self, seq: u32, message: &[u8]) -> [u8; 8] {
-        let mut mac =
-            Hmac::<Md5>::new_from_slice(&self.signing_key).expect("HMAC takes a 16-octet key");
-        mac.update(&seq.to_le_bytes());
-        mac.update(message);
-        let digest = mac.finalize().into_bytes();
+        // RRL-7.6: the MAC comes from the crypto layer, the same one NTOWFv2 is keyed with.
+        let digest = rrl_crypto::hmac_md5(&self.signing_key, &[&seq.to_le_bytes(), message]);
         let mut out = [0u8; 8];
         out.copy_from_slice(&digest[..8]);
         out
@@ -237,25 +232,19 @@ impl NtlmLayer {
 }
 
 /// `MD5(a || b || ...)`, which is how both keys are derived.
+///
+/// RRL-7.6: the digest comes from the crypto layer, so this file holds no primitive of its own.
 fn digest(parts: &[&[u8]]) -> [u8; 16] {
-    let mut hasher = Md5::new();
-    for part in parts {
-        hasher.update(part);
-    }
-    hasher.finalize().into()
+    rrl_crypto::md5_parts(parts)
 }
 
 /// Comparison that takes the same time whatever it finds, so a signature cannot be walked one octet
 /// at a time.
+///
+/// RRL-7.6: this was the eighth copy of the loop in the family, and the one my first sweep missed -
+/// it is named `constant_time` and not `ct_eq`, so a search for the name found seven.
 fn constant_time(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut difference = 0u8;
-    for (a, b) in left.iter().zip(right.iter()) {
-        difference |= a ^ b;
-    }
-    difference == 0
+    rrl_crypto::ct_eq(left, right)
 }
 
 #[cfg(test)]

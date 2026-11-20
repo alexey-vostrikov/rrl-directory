@@ -95,14 +95,61 @@ pub async fn export(
     let account = format!("{}$", netbios.to_uppercase());
     let principal = Principal::parse(&format!("{account}@{realm}"))
         .map_err(|err| format!("'{account}@{realm}' is not a principal: {err}"))?;
-    let dn = format!("cn={},cn=computers,{base_dn}", netbios);
+    // Where AD files a controller's own account: an organizational unit of its own, not the
+    // container the members it serves are created in.
+    let dn = format!(
+        "cn={},{},{base_dn}",
+        netbios,
+        crate::provision::DOMAIN_CONTROLLERS_OU
+    );
 
     let loaded = backend
         .load()
         .await
         .map_err(|err| format!("reading the directory: {err}"))?;
     let directory = loaded.into_directory(base_dn, "users", "groups");
-    let existing = directory.find(&dn).cloned();
+    let existing = match directory.find(&dn).cloned() {
+        Some(entry) => Some(entry),
+        // An account this server wrote before it filed controllers where AD files them lives in
+        // `cn=computers`. Found by its `sAMAccountName`, read through `record` because the snapshot's
+        // entries are skeletons - and carried over to the canonical DN below rather than left
+        // behind: a second account for the same controller carries a second SID, and the SIDs already
+        // handed out name the first.
+        None => {
+            let mut found = None;
+            for identity in directory.all() {
+                let Some(record) = directory.record(identity.dn()) else {
+                    continue;
+                };
+                let named = record
+                    .attributes()
+                    .get("sAMAccountName")
+                    .and_then(|attribute| attribute.values.first())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&account));
+                if named {
+                    found = Some(record.into_owned());
+                    break;
+                }
+            }
+            found
+        }
+    };
+    // The SID the account already carries, which travels with it: a write rebuilds the entry from the
+    // keytab, and a SID issued above is not the only case - an account that already has one and is
+    // written again, because it moved to the DN AD files controllers at or because its shape had to
+    // be repaired, keeps the value it has. Measured the hard way: the write rebuilt the entry without
+    // the SID the old one carried, and the move left a controller account no ACL could name.
+    let existing_sid = existing
+        .as_ref()
+        .and_then(|entry| entry.attributes().get("objectSid"))
+        .and_then(|attribute| attribute.values.first())
+        .filter(|value| !value.is_empty())
+        .cloned();
+    // The DN the account is stored at now, when that is not the canonical one.
+    let moved_from = existing
+        .as_ref()
+        .map(|entry| entry.dn().to_string())
+        .filter(|have| !have.eq_ignore_ascii_case(&dn));
 
     // Whether the account already carries a SID decides whether one has to be issued: `take` moves
     // the domain's counter, and a counter moved for an account that had one would skip a number for
@@ -118,16 +165,21 @@ pub async fn export(
     // otherwise skipped for it on every start, so the wrong shape would stay forever. Measured: the
     // schema reported `sAMAccountName`, `objectSid`, `dNSHostName` and `primaryGroupID` as "not
     // allowed by any object class" for the controller's own account on every reload.
+    // Both classes, and neither is optional: `computer` is what makes the entry a machine account,
+    // and `krb5KDCEntry` is what allows the realm's own attributes (`krb5KDCFlags` among them) to sit
+    // on it. An entry with one and not the other is one this command has to repair, which is why it
+    // is part of the shape rather than a separate condition.
     let shaped_like_an_account = existing.as_ref().is_some_and(|entry| {
-        entry
-            .attributes()
-            .get("objectClass")
-            .is_some_and(|attribute| {
-                attribute
-                    .values
-                    .iter()
-                    .any(|value| value.eq_ignore_ascii_case("computer"))
-            })
+        let Some(classes) = entry.attributes().get("objectClass") else {
+            return false;
+        };
+        let has = |wanted: &str| {
+            classes
+                .values
+                .iter()
+                .any(|value| <str>::eq_ignore_ascii_case(value, wanted))
+        };
+        has("computer") && has("krb5KDCEntry")
     });
     let (mut entry, mut created) = match existing {
         Some(entry) => (read_back(&entry, &principal)?, false),
@@ -219,7 +271,7 @@ pub async fn export(
     }
     // The account's SID, which is what a PAC is built from: a machine account without one is an
     // account every ticket for it says nothing about, and an ACL naming it can never match.
-    let mut sid_attribute = None;
+    let mut sid_attribute = existing_sid;
     if !has_sid {
         // `take` records the new position before returning, and a number skipped by a crash is a
         // number nobody can tell from one never used.
@@ -235,7 +287,9 @@ pub async fn export(
         sid_attribute = Some(base64::engine::general_purpose::STANDARD.encode(sid.to_bytes()));
     }
 
-    if created || sid_attribute.is_some() || !shaped_like_an_account {
+    // `has_sid` is false equally for a new account and for one that lost its SID, and both need the
+    // write. An account that already had one is written only when something else about it changed.
+    if created || !has_sid || !shaped_like_an_account || moved_from.is_some() {
         let mut entry = entry_of(&entry, dn.clone(), dns_host, dns_domain);
         if let Some(encoded) = sid_attribute {
             entry = crate::model::Entry::new(
@@ -257,7 +311,17 @@ pub async fn export(
                     .unwrap_or_default()
             );
         }
-        let changes = [EntryChange::Upsert { entry }];
+        let mut changes = vec![EntryChange::Upsert { entry }];
+        // The old DN goes in the same change: a store that kept both would have two accounts for one
+        // controller, and the second is one no SID ever named.
+        if let Some(old) = &moved_from {
+            // A controller's account is a user-shaped object, which is the kind the store needs to
+            // know to find it in the collection it lives in.
+            changes.push(EntryChange::Delete {
+                dn: old.clone(),
+                kind: Some(crate::backend::ObjectKind::User),
+            });
+        }
         backend
             .apply(&changes)
             .await
@@ -355,6 +419,11 @@ fn entry_of(account: &HdbEntry, dn: String, dns_host: &str, dns_domain: &str) ->
                 "organizationalPerson".to_string(),
                 "user".to_string(),
                 "computer".to_string(),
+                // Auxiliary, and it has to be here: `krb5KDCEntry` is the class that allows
+                // `krb5KDCFlags` and the rest of the realm's attributes on an account that is also a
+                // machine. `krb5Principal` is not - it is *structural*, and two structural classes
+                // from different trees is an entry the schema refuses.
+                "krb5KDCEntry".to_string(),
             ],
         ))
         .push(Attribute::single("cn", &short))

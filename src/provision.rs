@@ -21,6 +21,8 @@ use crate::model::{Attribute, Attributes, Entry};
 
 /// The class of a plain container, `1.2.840.113556.1.5.2`.
 pub const CONTAINER_CLASS: &str = "container";
+/// The class of an `ou=` entry.
+pub const ORGANIZATIONAL_UNIT_CLASS: &str = "organizationalUnit";
 
 /// The containers a domain root holds from the start, as DNs under `base_dn`.
 /// `entry` with the attributes AD writes into every object it creates, and its SID untouched.
@@ -35,9 +37,23 @@ pub fn stored(schema: &crate::schema::Schema, base_dn: &str, entry: Entry) -> En
     Entry::new(entry.dn().to_string(), attributes)
 }
 
+/// The containers a domain root holds from the start.
+///
+/// `cn=computers` is where a member's own account is created - the container a WKGUID search
+/// resolves to - and `ou=Domain Controllers` is where a controller's account lives. The second is
+/// not decoration: AD files every DC under that organizational unit, group policy for controllers
+/// is linked there by default, and a client that asks the directory which controllers it has reads
+/// that DN. Measured on the AD-join stand: a controller's own account sat in `cn=computers` beside
+/// the members it serves, which is a shape no AD deployment has.
 pub fn containers(base_dn: &str) -> Vec<String> {
-    vec![format!("cn=computers,{base_dn}")]
+    vec![
+        format!("cn=computers,{base_dn}"),
+        format!("{DOMAIN_CONTROLLERS_OU},{base_dn}"),
+    ]
 }
+
+/// The organizational unit a controller's own account is filed under.
+pub const DOMAIN_CONTROLLERS_OU: &str = "ou=Domain Controllers";
 
 /// The configuration naming context: `cn=Configuration,<forest root>`.
 ///
@@ -276,23 +292,32 @@ pub async fn ensure_containers(
     Ok(created)
 }
 
-/// A container entry: the class AD uses, and the common name its RDN names.
+/// A container entry: the class AD uses, and the name its RDN gives it.
+///
+/// Two shapes, because AD has two: a `cn=` container, and an `ou=` organizational unit. Which one it
+/// is decides both the class and the attribute the RDN names - an `ou=Domain Controllers` object is
+/// an `organizationalUnit` whose name lives in `ou`, and writing it as a `container` with a `cn`
+/// leaves an entry whose DN and attributes disagree about what it is.
 pub fn container_entry(dn: &str) -> Entry {
-    let label = dn
-        .split_once(',')
-        .map(|(first, _)| first)
-        .unwrap_or(dn)
+    let rdn = dn.split_once(',').map(|(first, _)| first).unwrap_or(dn);
+    let (attribute, class) = if rdn.trim_start().to_ascii_lowercase().starts_with("ou=") {
+        ("ou", ORGANIZATIONAL_UNIT_CLASS)
+    } else {
+        ("cn", CONTAINER_CLASS)
+    };
+    let label = rdn
         .trim()
-        .strip_prefix("cn=")
+        .split_once('=')
+        .map(|(_, value)| value)
         .unwrap_or_default()
         .to_string();
 
     let attributes = Attributes::new()
         .push(Attribute::new(
             crate::model::ATTR_OBJECT_CLASS,
-            vec!["top".to_string(), CONTAINER_CLASS.to_string()],
+            vec!["top".to_string(), class.to_string()],
         ))
-        .push(Attribute::single("cn", &label))
+        .push(Attribute::single(attribute, &label))
         .push(Attribute::single(crate::model::ATTR_ENTRY_UUID, "").operational());
 
     Entry::new(dn.to_string(), attributes)
@@ -308,7 +333,11 @@ mod tests {
         // different container in the well-known table is resolved by that value instead.
         assert_eq!(
             containers("dc=example,dc=com"),
-            vec!["cn=computers,dc=example,dc=com".to_string()]
+            vec![
+                "cn=computers,dc=example,dc=com".to_string(),
+                // Where a controller's own account is filed, as AD files it.
+                "ou=Domain Controllers,dc=example,dc=com".to_string(),
+            ]
         );
     }
 

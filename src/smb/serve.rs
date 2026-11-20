@@ -182,9 +182,10 @@ pub async fn start(
                 logon_users: logon_users.clone(),
                 // This listener is the interface itself, not the mapper: nothing is published here.
                 publish: None,
-                // `netlogon` is not here: it answers on the port below, because a client that finds
-                // two interfaces on one port uses neither over TCP.
-                channel_state: None,
+                // The state here answers `lsarpc` and `samr`, which the mapper publishes on this
+                // port; `netlogon` has a port of its own below, because a client that finds two
+                // interfaces announced on one port uses neither over TCP.
+                channel_state: Some(smb_server::tcp::ChannelState(channel_state.clone())),
             };
             // A listener that cannot be taken is a startup failure naming the address, which is what
             // an operator can act on; the port is released again immediately, because the task

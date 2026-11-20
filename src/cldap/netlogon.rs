@@ -527,6 +527,41 @@ mod tests {
         );
     }
 
+    /// Each level sets exactly the bits up to itself, and a 2008-level domain sets none of them.
+    ///
+    /// The four bits say "this server is at least as new as X", so a client of an old release learns
+    /// nothing it cannot use and a client of a new one is not promised a level that is not there. A
+    /// server that set them all regardless would answer a 2025 client about a 2025 domain while its
+    /// schema says 2008 - the disagreement this table exists to keep out of the wire.
+    #[test]
+    fn every_level_sets_the_bits_up_to_itself_and_no_others() {
+        let mut server = advertised();
+        let level_bits = [
+            flags::DS_DS_8_FLAG,
+            flags::DS_DS_9_FLAG,
+            flags::DS_DS_10_FLAG,
+            flags::DS_DS_13_FLAG,
+        ];
+
+        // A row per level: how many of the four bits it may set.
+        for (level, expected) in [(3, 0), (4, 1), (5, 2), (6, 3), (7, 3), (10, 4)] {
+            server.functionality = level;
+            let set: Vec<u32> = level_bits
+                .iter()
+                .copied()
+                .filter(|bit| server.flags() & bit != 0)
+                .collect();
+            assert_eq!(
+                set.len(),
+                expected,
+                "level {level} set {set:x?}, and it may set {expected} of the four level bits"
+            );
+            // And the ones it sets are the first `expected` of them, in order: a gap would be a bit
+            // claiming a level the server skipped over.
+            assert_eq!(set[..], level_bits[..expected], "level {level}");
+        }
+    }
+
     #[test]
     fn a_dns_name_is_written_as_length_prefixed_labels() {
         let mut out = Vec::new();

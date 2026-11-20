@@ -1,10 +1,16 @@
 //! What this directory says it is, to a client that asks the way a Windows one does.
 //!
-//! Active Directory has no functional level of its own for Windows Server 2019 or 2022: both run at
-//! the 2016 level, and the only thing that moved between them is the schema (`objectVersion` 87 for
-//! 2016, 88 for 2019 and 2022, 89 through 91 for 2025). So "behave like 2022" is not a level to claim
-//! but a **number to publish**, and an operator who wants a client to believe it is talking to a
-//! particular release has to choose both.
+//! A Windows Server release is two numbers, and they move independently: the **domain level**
+//! (`domainFunctionality`) and the **schema** (`objectVersion`). Below 2016 every release moved both -
+//! 2008 is level 3 with `sch44`, 2008 R2 is 4 with 47, 2012 is 5 with 56, 2012 R2 is 6 with 69. From
+//! 2016 on they separate: 2016 is level 7 with `sch87`, and 2019 and 2022 raised the schema to 88 and
+//! left the level at 7. 2025 is level 10 with `sch89` through 91 - the first new level since 2016, and
+//! the only one since then that changed a field a client reads.
+//!
+//! So "behave like 2012 R2" is not a level to claim but a **pair to publish**, and an operator who
+//! wants a client to believe it is talking to a particular release has to choose both. The pair is
+//! checked when the configuration is read: a schema no release shipped is refused, because it would
+//! state a level no release had.
 //!
 //! What is published says it is an emulation. A domain that claims to be Microsoft's product without
 //! saying otherwise is a domain an operator cannot tell apart from a real one in a log, and this
@@ -14,12 +20,52 @@ use serde::{Deserialize, Serialize};
 
 /// The lowest and highest `objectVersion` this server can publish.
 ///
-/// `sch70` is the first file Windows Server 2016 brought and `sch91` the last of Windows Server 2025's,
-/// so the range covers every release a client might be asked to recognise. Lower versions describe a
-/// schema this server does not implement at all, and a higher one names a release that does not exist.
-pub const MIN_SCHEMA_VERSION: u8 = 70;
+/// The range now starts at `sch44`, the schema Windows Server 2008 brought: a domain that says it is
+/// at level 3 has to publish a schema of that line, and a client of that release reads the number
+/// before it decides what to ask for. Above it, `sch91` is the last schema Windows Server 2025 wrote.
+pub const MIN_SCHEMA_VERSION: u8 = 44;
 /// See [`MIN_SCHEMA_VERSION`].
 pub const MAX_SCHEMA_VERSION: u8 = 91;
+
+/// The schema versions that exist, and the domain level each one implies.
+///
+/// Not every number in the range is a release. `sch70` through `sch86` are the intermediate files
+/// between Windows Server 2012 R2 and 2016, and none of them shipped as a product a client can name
+/// itself after; publishing one would state a level no release ever had. The pairs below are the
+/// documented ones, and a number outside this table is refused rather than guessed at - a domain
+/// whose level was invented is worse than one that refuses to start.
+///
+/// The two columns are **not** one ladder. 2016 and 2019 answer the same level with different
+/// schemas, so the schema decides and the level follows:
+///
+/// | schema | level | release |
+/// |---|---|---|
+/// | 44 | 3 | Windows Server 2008 |
+/// | 47 | 4 | Windows Server 2008 R2 |
+/// | 56 | 5 | Windows Server 2012 |
+/// | 69 | 6 | Windows Server 2012 R2 |
+/// | 87 | 7 | Windows Server 2016 |
+/// | 88 | 7 | Windows Server 2019 and 2022 |
+/// | 89-91 | 10 | Windows Server 2025 |
+const SCHEMA_LEVELS: [(u8, u32); 9] = [
+    (44, 3),
+    (47, 4),
+    (56, 5),
+    (69, 6),
+    (87, 7),
+    (88, 7),
+    (89, 10),
+    (90, 10),
+    (91, 10),
+];
+
+/// The level a schema version stands for, or `None` for a number no release used.
+fn level_of(schema: u8) -> Option<u32> {
+    SCHEMA_LEVELS
+        .iter()
+        .find(|(version, _)| *version == schema)
+        .map(|(_, level)| *level)
+}
 
 /// The Windows Server a domain says it emulates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,13 +156,17 @@ impl EmulationConfig {
 
     /// `domainFunctionality` and `forestFunctionality`, as the schema version implies them.
     ///
-    /// The two are not one ladder. `sch87` (2016) and `sch88` (2019, 2022) both answer **7**: 2019 and
-    /// 2022 raised the schema and left the level alone. `sch89` and later answer **10**, the first new
-    /// level since 2016, which Windows Server 2025 introduced for the 32k-page database.
+    /// The two columns are not one ladder: `sch87` (2016) and `sch88` (2019, 2022) both answer **7**,
+    /// because 2019 and 2022 raised the schema and left the level alone. Below 2016 each release
+    /// moved both, which is why the table in [`SCHEMA_LEVELS`] is the only way to get this right.
     pub fn functionality(&self) -> &'static str {
         match self.functionality_number() {
-            10 => "10",
-            _ => "7",
+            3 => "3",
+            4 => "4",
+            5 => "5",
+            6 => "6",
+            7 => "7",
+            _ => "10",
         }
     }
 
@@ -125,7 +175,11 @@ impl EmulationConfig {
     /// `DS_FLAG` bits in a locator answer are one example: each says "not older than", so the answer
     /// depends on the order of the levels, not on their spelling.
     pub fn functionality_number(&self) -> u32 {
-        if self.schema_version >= 89 { 10 } else { 7 }
+        // A schema no release used has no level, and `validate` refuses it at load. The fallback is
+        // the **oldest** level rather than the newest: an answer that promises less is one a client
+        // can work around, and an answer that promises more is the failure this whole table exists
+        // to prevent.
+        level_of(self.schema_version).unwrap_or(3)
     }
 
     /// `objectVersion`, as the string a client reads.
@@ -137,9 +191,27 @@ impl EmulationConfig {
     pub fn validate(&self) -> Result<(), String> {
         if !(MIN_SCHEMA_VERSION..=MAX_SCHEMA_VERSION).contains(&self.schema_version) {
             return Err(format!(
-                "schema_version {} is outside {}..={}: sch70 is the oldest schema a Windows client \
-                 recognises and sch91 the newest that exists",
+                "schema_version {} is outside {}..={}: sch44 is the oldest schema a Windows Server \
+                 client recognises and sch91 the newest that exists",
                 self.schema_version, MIN_SCHEMA_VERSION, MAX_SCHEMA_VERSION
+            ));
+        }
+        // A number inside the range is not enough: the years between 2012 R2 and 2016 produced schema
+        // files that never shipped, and each of them would state a level no release ever had. Read
+        // the level from the table instead of inventing one.
+        if level_of(self.schema_version).is_none() {
+            let known: Vec<String> = {
+                let mut versions: Vec<u8> = SCHEMA_LEVELS.iter().map(|(v, _)| *v).collect();
+                versions.sort_unstable();
+                versions.iter().map(u8::to_string).collect()
+            };
+            return Err(format!(
+                "schema_version {} is not a schema any Windows Server release published, so it \
+                 implies no domain level: the ones that exist are {} - 44 is 2008, 47 is 2008 R2, \
+                 56 is 2012, 69 is 2012 R2, 87 is 2016, 88 is 2019 and 2022, and 89 through 91 are \
+                 2025",
+                self.schema_version,
+                known.join(", ")
             ));
         }
         for (name, value) in [
@@ -172,6 +244,19 @@ mod tests {
 
     #[test]
     fn the_schema_version_decides_the_level_and_not_the_other_way_round() {
+        // Below 2016 every release moved both columns, so the pair is what has to be right.
+        for (schema, level) in [(44, "3"), (47, "4"), (56, "5"), (69, "6")] {
+            let config = EmulationConfig {
+                schema_version: schema,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.functionality(),
+                level,
+                "sch{schema} is Windows Server level {level}"
+            );
+            assert!(config.validate().is_ok());
+        }
         // 2016 and 2019/2022 are the same level: the schema moved and the level did not.
         assert_eq!(
             EmulationConfig {
@@ -206,13 +291,51 @@ mod tests {
             .functionality(),
             "10"
         );
-        // And the whole range is answerable, which is what makes it configurable.
-        for version in MIN_SCHEMA_VERSION..=MAX_SCHEMA_VERSION {
+    }
+
+    /// Every level the task asks for is reachable, and each one from one schema and no other.
+    #[test]
+    fn every_level_from_2008_to_2025_has_a_schema_of_its_own() {
+        for level in [3, 4, 5, 6, 7, 10] {
+            let schemas: Vec<u8> = (MIN_SCHEMA_VERSION..=MAX_SCHEMA_VERSION)
+                .filter(|version| {
+                    EmulationConfig {
+                        schema_version: *version,
+                        ..Default::default()
+                    }
+                    .functionality_number()
+                        == level
+                })
+                .collect();
+            assert!(
+                !schemas.is_empty(),
+                "no schema publishes level {level}: a client of that release has nothing to connect to"
+            );
+        }
+    }
+
+    /// A schema no release published states a level no release had, so it is refused.
+    #[test]
+    fn a_schema_no_release_published_is_refused_and_the_ones_that_exist_are_named() {
+        // 70 through 86 are the files between 2012 R2 and 2016; none shipped.
+        for undocumented in [70, 76, 80, 84, 86] {
             let config = EmulationConfig {
-                schema_version: version,
+                schema_version: undocumented,
                 ..Default::default()
             };
-            assert!(config.validate().is_ok(), "{version} must be publishable");
+            let message = config
+                .validate()
+                .expect_err(&format!("sch{undocumented} is not a release"));
+            assert!(
+                message.contains("implies no domain level"),
+                "the refusal has to say why: {message}"
+            );
+            for known in ["44", "47", "56", "69", "87", "88", "91"] {
+                assert!(
+                    message.contains(known),
+                    "the refusal has to name the versions that do exist, {known} is missing: {message}"
+                );
+            }
         }
     }
 
@@ -239,11 +362,11 @@ mod tests {
     #[test]
     fn a_version_outside_the_range_is_refused_with_the_reason() {
         let too_old = EmulationConfig {
-            schema_version: 69,
+            schema_version: 43,
             ..Default::default()
         };
-        let message = too_old.validate().expect_err("69 is below the range");
-        assert!(message.contains("70..=91"), "{message}");
+        let message = too_old.validate().expect_err("43 is below the range");
+        assert!(message.contains("44..=91"), "{message}");
         let too_new = EmulationConfig {
             schema_version: 92,
             ..Default::default()

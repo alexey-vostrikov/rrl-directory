@@ -1082,6 +1082,7 @@ async fn serve() {
             &config.base_dn,
             bind,
             kdc_here,
+            config.emulation.functionality_number(),
         ) {
             Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),
             Ok(settings) => match tokio::net::UdpSocket::bind(bind).await {

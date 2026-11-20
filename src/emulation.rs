@@ -114,7 +114,18 @@ impl EmulationConfig {
     /// 2022 raised the schema and left the level alone. `sch89` and later answer **10**, the first new
     /// level since 2016, which Windows Server 2025 introduced for the 32k-page database.
     pub fn functionality(&self) -> &'static str {
-        if self.schema_version >= 89 { "10" } else { "7" }
+        match self.functionality_number() {
+            10 => "10",
+            _ => "7",
+        }
+    }
+
+    /// The same level as a number, for the places that compare rather than publish it.
+    ///
+    /// `DS_FLAG` bits in a locator answer are one example: each says "not older than", so the answer
+    /// depends on the order of the levels, not on their spelling.
+    pub fn functionality_number(&self) -> u32 {
+        if self.schema_version >= 89 { 10 } else { 7 }
     }
 
     /// `objectVersion`, as the string a client reads.

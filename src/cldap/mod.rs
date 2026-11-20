@@ -323,6 +323,7 @@ impl Settings {
         base_dn: &str,
         bound: std::net::SocketAddr,
         kdc: bool,
+        functionality: u32,
     ) -> Result<Self, String> {
         let from_base = domain_of_base(base_dn).ok_or_else(|| {
             format!("the naming context '{base_dn}' has no dc= components to make a DNS name from")
@@ -403,6 +404,7 @@ impl Settings {
                 netbios_domain,
                 netbios_host,
                 kdc,
+                functionality,
                 address,
                 site: netlogon::DEFAULT_SITE.to_string(),
             },
@@ -582,6 +584,7 @@ mod tests {
     fn advertised() -> netlogon::Advertised {
         netlogon::Advertised {
             kdc: false,
+            functionality: 7,
             dns_domain: "example.com".to_string(),
             dns_forest: "example.com".to_string(),
             dns_host: "dc1.example.com".to_string(),
@@ -842,9 +845,14 @@ mod tests {
     #[test]
     fn the_settings_are_derived_from_what_the_server_already_knows() {
         let bound: std::net::SocketAddr = "192.0.2.10:389".parse().expect("parses");
-        let settings =
-            Settings::resolve(&CldapConfig::default(), "dc=example,dc=com", bound, false)
-                .expect("resolves");
+        let settings = Settings::resolve(
+            &CldapConfig::default(),
+            "dc=example,dc=com",
+            bound,
+            false,
+            7,
+        )
+        .expect("resolves");
 
         assert_eq!(settings.advertised.dns_domain, "example.com");
         assert_eq!(settings.advertised.dns_forest, "example.com");
@@ -857,8 +865,14 @@ mod tests {
         );
         // The same domain always yields the same GUID, which is what a client caching a controller
         // relies on.
-        let again = Settings::resolve(&CldapConfig::default(), "dc=example,dc=com", bound, false)
-            .expect("resolves");
+        let again = Settings::resolve(
+            &CldapConfig::default(),
+            "dc=example,dc=com",
+            bound,
+            false,
+            7,
+        )
+        .expect("resolves");
         assert_eq!(
             settings.advertised.domain_guid,
             again.advertised.domain_guid
@@ -868,9 +882,14 @@ mod tests {
     #[test]
     fn a_wildcard_bind_advertises_the_loopback_address_rather_than_nothing() {
         let bound: std::net::SocketAddr = "0.0.0.0:389".parse().expect("parses");
-        let settings =
-            Settings::resolve(&CldapConfig::default(), "dc=example,dc=com", bound, false)
-                .expect("resolves");
+        let settings = Settings::resolve(
+            &CldapConfig::default(),
+            "dc=example,dc=com",
+            bound,
+            false,
+            7,
+        )
+        .expect("resolves");
 
         assert_eq!(settings.advertised.address, Ipv4Addr::LOCALHOST);
     }
@@ -884,7 +903,7 @@ mod tests {
             ..CldapConfig::default()
         };
 
-        let refused = Settings::resolve(&config, "dc=example,dc=com", bound, false)
+        let refused = Settings::resolve(&config, "dc=example,dc=com", bound, false, 7)
             .expect_err("a controller answers for the naming context it holds");
 
         assert!(refused.contains("other.example"), "{refused}");
@@ -908,7 +927,7 @@ mod tests {
                 ..CldapConfig::default()
             },
         ] {
-            assert!(Settings::resolve(&config, "dc=example,dc=com", bound, false).is_err());
+            assert!(Settings::resolve(&config, "dc=example,dc=com", bound, false, 7).is_err());
         }
     }
 
@@ -920,7 +939,7 @@ mod tests {
             ..CldapConfig::default()
         };
         let settings =
-            Settings::resolve(&config, "dc=example,dc=com", bound, false).expect("resolves");
+            Settings::resolve(&config, "dc=example,dc=com", bound, false, 7).expect("resolves");
 
         // Configured names are taken as written; the truncation is what a *derived* name gets, and
         // this test pins that the configured one is not silently cut.

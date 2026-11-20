@@ -66,6 +66,10 @@ pub mod flags {
     pub const DS_DS_8_FLAG: u32 = 0x0000_4000;
     pub const DS_DS_9_FLAG: u32 = 0x0000_8000;
     pub const DS_DS_10_FLAG: u32 = 0x0001_0000;
+    /// The server is not running anything from 2000 through 2022 - the level a Windows Server 2025
+    /// client looks for. `MS-ADTS` 6.3.1.2 names it `FW13`; the number in the name is the level, not
+    /// the year, and the levels ran 8, 9, 10, 13 as the operating systems they describe did not.
+    pub const DS_DS_13_FLAG: u32 = 0x0004_0000;
 }
 
 /// NETLOGON_NT_VERSION bits (`MS-ADTS` 6.3.1.1).
@@ -148,6 +152,10 @@ pub struct Advertised {
     /// Not a property of the ping: the same crate answers it in a deployment with no KDC at all,
     /// and there `DS_KDC_FLAG` would be a promise nothing keeps.
     pub kdc: bool,
+    /// The functional level this server emulates, as `domainFunctionality` numbers it: 7 for 2016 and
+    /// everything that kept that level, 10 for 2025. The locator's answer carries one "not older
+    /// than" bit per level up to this one, so the bits are derived from it rather than listed.
+    pub functionality: u32,
 }
 
 impl Advertised {
@@ -160,15 +168,27 @@ impl Advertised {
     /// answers pings and issues no tickets says so instead of being found and then failing at
     /// `AS-REQ`.
     pub fn flags(&self) -> u32 {
-        let base = flags::DS_LDAP_FLAG
+        let mut base = flags::DS_LDAP_FLAG
             | flags::DS_DS_FLAG
             | flags::DS_WRITABLE_FLAG
-            | flags::DS_DS_8_FLAG
-            | flags::DS_DS_9_FLAG
-            | flags::DS_DS_10_FLAG
             | flags::DS_DNS_CONTROLLER_FLAG
             | flags::DS_DNS_DOMAIN_FLAG
             | flags::DS_DNS_FOREST_FLAG;
+        // One bit per level the server is at least as new as. A bit set without its level behind it
+        // would be a promise about a controller that does not exist, and a client that trusts it
+        // would then ask for something this server cannot do.
+        if self.functionality >= 4 {
+            base |= flags::DS_DS_8_FLAG;
+        }
+        if self.functionality >= 5 {
+            base |= flags::DS_DS_9_FLAG;
+        }
+        if self.functionality >= 6 {
+            base |= flags::DS_DS_10_FLAG;
+        }
+        if self.functionality >= 10 {
+            base |= flags::DS_DS_13_FLAG;
+        }
         if self.kdc {
             base | flags::DS_KDC_FLAG
         } else {
@@ -469,6 +489,7 @@ mod tests {
     fn advertised() -> Advertised {
         Advertised {
             kdc: false,
+            functionality: 7,
             dns_domain: "example.com".to_string(),
             dns_forest: "example.com".to_string(),
             dns_host: "dc1.example.com".to_string(),
@@ -478,6 +499,32 @@ mod tests {
             address: Ipv4Addr::new(192, 0, 2, 10),
             site: String::new(),
         }
+    }
+
+    #[test]
+    fn a_2025_controller_says_it_is_newer_than_2022() {
+        let mut older = advertised();
+        older.functionality = 7;
+        let mut newer = advertised();
+        newer.functionality = 10;
+
+        assert_eq!(
+            older.flags() & flags::DS_DS_13_FLAG,
+            0,
+            "a 2016-level controller must not claim to be newer than 2022"
+        );
+        assert_ne!(
+            newer.flags() & flags::DS_DS_13_FLAG,
+            0,
+            "a 2025-level controller has to set the bit a 2025 client looks for"
+        );
+        // The lower levels stay set: each bit is "not older than", so a newer server sets the older
+        // bits too and a client that only knows 2008 R2 still finds it.
+        assert_eq!(
+            newer.flags() & flags::DS_DS_8_FLAG,
+            flags::DS_DS_8_FLAG,
+            "the older level bits are not replaced by the newer one"
+        );
     }
 
     #[test]

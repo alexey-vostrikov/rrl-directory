@@ -7,7 +7,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
-use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use super::policy::PasswordPolicy;
@@ -239,7 +238,9 @@ fn sha_crypt_verify(password: &str, payload: &str, scheme: Scheme) -> Result<boo
 }
 
 fn ct_eq(left: &[u8], right: &[u8]) -> bool {
-    left.len() == right.len() && bool::from(left.ct_eq(right))
+    // RRL-7.2: the crypto layer's comparison, not a second one from `subtle`, so the family has one
+    // answer to "how do we compare a secret" and one place to change it.
+    rrl_crypto::ct_eq(left, right)
 }
 
 fn malformed(scheme: Scheme, reason: &'static str) -> PasswordError {

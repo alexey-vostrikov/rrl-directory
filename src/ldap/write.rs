@@ -197,6 +197,31 @@ fn rename_naming_attribute(
     attributes
 }
 
+#[cfg(test)]
+mod rdn_tests {
+    use super::*;
+
+    /// The entry carries the attribute its name is made of, even when the client omitted it.
+    ///
+    /// A Windows client writes `cn=DOCKERW-W25,...` with no `cn` in the attribute list, and a
+    /// directory that keeps the entry without it cannot answer `(cn=DOCKERW-W25)` - the search a
+    /// client makes for its own machine account once it is a member.
+    #[test]
+    fn a_name_supplies_its_own_attribute() {
+        let entry = "cn=DOCKERW-W25,cn=computers,dc=ad,dc=example,dc=com";
+        let (attribute, value, _) = dn::split_first_rdn(entry);
+        assert_eq!(attribute, "cn");
+        assert_eq!(dn::unescape(&value), "DOCKERW-W25");
+    }
+
+    /// A value with an escape keeps the character it was escaped for: `cn=Doe\, John` is one RDN.
+    #[test]
+    fn an_escaped_value_is_unescaped_once() {
+        let (_, value, _) = dn::split_first_rdn("cn=Doe\\, John,ou=people,dc=ad,dc=example,dc=com");
+        assert_eq!(dn::unescape(&value), "Doe, John");
+    }
+}
+
 /// Handles an add request.
 pub fn handle_add(
     session: &Session,
@@ -255,6 +280,21 @@ pub fn handle_add(
             built = built.case_sensitive().sensitive();
         }
         attributes = attributes.push(built);
+    }
+
+    // The attribute the name is made of belongs to the entry whether the client sent it or not.
+    // Windows writes `cn=DOCKERW-W25,cn=computers,...` and leaves `cn` out of the attribute list,
+    // because in AD the name supplies the value; RFC 4511 §4.7 says the same. Without this the
+    // entry carries a name and nothing to find it by: a search for `(cn=DOCKERW-W25)` matches
+    // nothing, and that search is how a client looks up its own machine account after a reboot.
+    // Measured on a Windows Server 2025 join: the account was created, the join reported success,
+    // and every lookup by name afterwards came back empty.
+    let (rdn_attribute, rdn_value, _) = dn::split_first_rdn(&entry_dn);
+    if !rdn_attribute.is_empty() && attributes.get(&rdn_attribute).is_none() {
+        attributes = attributes.push(Attribute::new(
+            &rdn_attribute,
+            vec![crate::dn::unescape(&rdn_value)],
+        ));
     }
 
     // The SID, before the schema check rather than after: the schema has something to say about

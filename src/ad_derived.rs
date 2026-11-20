@@ -452,6 +452,7 @@ mod tests {
         assert_eq!(security_descriptor_portions(&raw, 0), raw);
     }
 
+    #[test]
     fn the_security_descriptor_is_well_formed() {
         use base64::Engine as _;
         let encoded = security_descriptor();

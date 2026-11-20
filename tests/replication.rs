@@ -57,14 +57,66 @@ fn config(port: u16, server_id: u16, peer: Option<u16>, path: &Path) -> String {
 
 struct Node {
     child: std::process::Child,
+    /// The node's own stderr. A child whose shutdown goes wrong explains itself there, and with
+    /// `Stdio::null()` that explanation was thrown away — the only thing visible was a timeout.
+    log: PathBuf,
     _dir: tempfile::TempDir,
 }
 
 impl Drop for Node {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        stop(&mut self.child, &self.log);
     }
+}
+
+/// Stops a node the way an operator does: SIGTERM, then wait for it to exit on its own.
+///
+/// `Child::kill()` sends SIGKILL, and that has a consequence beyond tidiness. SIGKILL runs no exit
+/// handlers, so under `cargo llvm-cov` the daemon never flushes its profile: `src/main.rs`, the
+/// 1118 lines of wiring that this file is the only exercise of, is then reported at 0% coverage —
+/// and the graceful shutdown path inside it was never measured at all. Nothing was wrong with the
+/// code; the teardown threw the evidence away.
+///
+/// The signal goes through the shell's own `kill` rather than through `libc` (not a dependency
+/// here) or through `/bin/kill` — that binary is absent from the metrics image, and sending the
+/// signal through it failed silently: no SIGTERM, every node killed after the timeout, and the
+/// coverage still at zero with nothing in the log to say why. The exit status is therefore
+/// checked, not ignored. Escalation stays: a node that ignores SIGTERM must not hold its port for
+/// the next run.
+fn stop(child: &mut std::process::Child, log: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        let pid = child.id().to_string();
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -TERM {pid}"))
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            other => panic!("could not send SIGTERM to node {pid}: {other:?}"),
+        }
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+        // Loud, not silent: a node that has to be killed is a node whose shutdown path went
+        // wrong, and it also means this run loses that node's coverage entirely. Its own account
+        // of what it was doing is in the log next to the message.
+        eprintln!(
+            "node {} ignored SIGTERM for {}s; sending SIGKILL. Its log:\n{}",
+            child.id(),
+            started.elapsed().as_secs(),
+            std::fs::read_to_string(log).unwrap_or_default()
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Starts one node and waits until it accepts connections.
@@ -78,26 +130,31 @@ fn start(port: u16, server_id: u16, peer: Option<u16>) -> Node {
         .expect("write config");
 
     let binary: PathBuf = env!("CARGO_BIN_EXE_rrl-directory").into();
+    let log = dir.path().join("node.log");
+    let stderr = std::fs::File::create(&log).expect("node log");
     let mut child = std::process::Command::new(binary)
         .arg("-c")
         .arg(&config_path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr))
         .spawn()
         .expect("start the server");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Node { child, _dir: dir };
+            return Node {
+                child,
+                log,
+                _dir: dir,
+            };
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 
     // The child is reaped before the panic: a process left running would hold its port and its
     // store file, and the next run would fail for a reason that belongs to this one.
-    let _ = child.kill();
-    let _ = child.wait();
+    stop(&mut child, &log);
     panic!("the server on port {port} never started listening");
 }
 

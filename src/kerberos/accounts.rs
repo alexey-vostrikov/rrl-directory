@@ -198,6 +198,45 @@ impl MachineAccounts for DirectoryAccounts {
             .ok()
     }
 
+    /// Writes `userAccountControl` for `account`, and says whether the store took it.
+    ///
+    /// `samr_SetUserInfo` class 16 is how a member disables its own account while leaving the
+    /// domain, and this is the write behind it. Replaced and not pushed, for the reason the
+    /// password write gives: two `userAccountControl` values leave the flags ambiguous, and the
+    /// reader takes whichever it finds first.
+    async fn set_machine_control(&self, account: &str, control: u32) -> bool {
+        let Some(entry) = self.existing(account).await else {
+            tracing::warn!(
+                account,
+                "samr: SetUserInfo for an account that is not there"
+            );
+            return false;
+        };
+        let attributes = entry
+            .attributes()
+            .clone()
+            .without("userAccountControl")
+            .push(crate::model::Attribute::single(
+                "userAccountControl",
+                &control.to_string(),
+            ));
+        let replaced = crate::model::Entry::new(entry.dn(), attributes);
+        match self
+            .source
+            .apply(&[crate::backend::EntryChange::Upsert { entry: replaced }])
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(account, control, "samr: account flags written");
+                true
+            }
+            Err(err) => {
+                tracing::warn!(account, control, %err, "samr: the store refused the flags");
+                false
+            }
+        }
+    }
+
     /// Removes the machine account `account` from the directory.
     ///
     /// The counterpart of `create_machine`, called by `samr_DeleteUser` when a join undoes the

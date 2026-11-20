@@ -17,6 +17,8 @@ use super::paged::{self, PAGED_RESULTS_OID, Page};
 
 /// `manageDsaIT` (RFC 3296 §2): "do not redirect me, treat special objects as entries".
 pub const MANAGEDSAIT_OID: &str = "2.16.840.1.113730.3.4.2";
+/// `LDAP_SERVER_SD_FLAGS_OID`: which portions of `nTSecurityDescriptor` to return.
+pub const SD_FLAGS_OID: &str = "1.2.840.113556.1.4.801";
 use super::responses::{self, search_done_with_controls, search_result_entry};
 use super::session::Session;
 use super::sort;
@@ -66,6 +68,23 @@ pub fn handle_search(
     controls: Option<&Controls>,
     security: &Security,
 ) -> Vec<LdapMessage> {
+    // Every request, as the client sent it, before any branch decides what to do with it. A join
+    // that fails on a search says only a status; the request is what says which search it was.
+    if std::env::var_os("RRL_LDAP_DIAG").is_some() {
+        tracing::warn!(
+            base = request.base_object.0.as_str(),
+            scope = ?request.scope,
+            filter = ?request.filter,
+            attributes = ?request
+                .attributes
+                .iter()
+                .map(|a| a.0.as_str())
+                .collect::<Vec<_>>(),
+            controls = controls.is_some(),
+            "ldap: search request"
+        );
+    }
+
     // As the client spelled it: the root DSE, the subschema subentry and `cn=config` answer with
     // the name they were asked by, and a client that reads its own spelling back is how a server
     // says "yes, that is the entry you meant".
@@ -118,6 +137,7 @@ pub fn handle_search(
     let mut sort_critical = false;
     let mut virtual_list: Option<sort::VirtualList> = None;
     let mut manage_dsa_it = false;
+    let mut sd_flags: Option<u32> = None;
     let mut sync_request: Option<sync::SyncRequest> = None;
     for control in controls.into_iter().flatten() {
         if control.control_type.as_ref() == PAGED_RESULTS_OID.as_bytes() {
@@ -211,6 +231,33 @@ pub fn handle_search(
             // me, answer for this DN yourself. Recognising it is also what keeps a critical
             // ManageDsaIT from being refused as an unknown extension.
             manage_dsa_it = true;
+        } else if control.control_type.as_ref() == SD_FLAGS_OID.as_bytes() {
+            // The value is one integer, BER-encoded as an octet string of four bytes: the mask.
+            // Windows sends this with every read of `nTSecurityDescriptor`, and marks it critical -
+            // so a server that does not know it refuses the search, and the join reads that refusal
+            // as "cannot tell whether the account exists" and stops at `0x3eb`.
+            match control.control_value.as_ref() {
+                Some(value) => {
+                    let bytes = value.as_ref();
+                    if bytes.len() < 4 {
+                        return vec![responses::search_done(
+                            message_id,
+                            ResultCode::ProtocolError,
+                            "the SD flags control carries fewer than four octets",
+                        )];
+                    }
+                    let mut mask = [0u8; 4];
+                    mask.copy_from_slice(&bytes[..4]);
+                    sd_flags = Some(u32::from_le_bytes(mask));
+                }
+                None => {
+                    return vec![responses::search_done(
+                        message_id,
+                        ResultCode::ProtocolError,
+                        "the SD flags control carries no value",
+                    )];
+                }
+            }
         } else if control.criticality && security.respect_control_criticality {
             return vec![responses::search_done(
                 message_id,
@@ -605,6 +652,37 @@ pub fn handle_search(
                     .read
             })
             .collect();
+        // The security descriptor is stored whole, while the SD flags control asks for part of it.
+        // Cut here, where the answer is composed: the stored value stays complete for every other
+        // client, and a client that asked for the DACL alone gets the DACL alone.
+        let visible: Vec<Attribute> = match sd_flags {
+            None => visible,
+            Some(mask) => visible
+                .into_iter()
+                .map(|attribute| {
+                    if !attribute.name.eq_ignore_ascii_case("nTSecurityDescriptor") {
+                        return attribute;
+                    }
+                    let values = attribute
+                        .values
+                        .iter()
+                        .map(|value| {
+                            let raw = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                value,
+                            )
+                            .unwrap_or_default();
+                            let cut = crate::ad_derived::security_descriptor_portions(&raw, mask);
+                            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &cut)
+                        })
+                        .collect();
+                    Attribute {
+                        values,
+                        ..attribute
+                    }
+                })
+                .collect(),
+        };
         if std::env::var_os("RRL_LDAP_DIAG").is_some()
             && dn.to_ascii_lowercase().contains("dockerw")
         {

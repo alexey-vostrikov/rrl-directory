@@ -137,6 +137,48 @@ pub fn synthesised(dn: &str, attributes: &Attributes, base_dn: &str) -> Attribut
     out
 }
 
+/// The same descriptor with only the portions a client asked for.
+///
+/// `LDAP_SERVER_SD_FLAGS_OID` (`MS-ADTS` 3.1.1.3.4.1.10) lets a client name which sections of a
+/// security descriptor it wants: owner `1`, group `2`, DACL `4`, SACL `8`. A mask of zero means no
+/// preference, and the whole descriptor is returned.
+///
+/// This server's descriptor carries a DACL and nothing else - no owner, no group, no SACL - so the
+/// only thing the mask can change is whether that DACL is present. Stripping it is not deleting
+/// bytes at the end: the header's `Dacl` offset has to become zero and `SE_DACL_PRESENT` has to come
+/// off, because a receiver reads those two as the answer to "is a DACL here", and a descriptor that
+/// claims one and has none is what makes a client report a malformed descriptor.
+#[must_use]
+pub fn security_descriptor_portions(descriptor: &[u8], mask: u32) -> Vec<u8> {
+    const SE_DACL_PRESENT: u16 = 0x0004;
+    const HEADER: usize = 20;
+    /// `OWNER | GROUP | DACL | SACL`, the four sections `SD_FLAGS` numbers.
+    const ALL: u32 = 0x0F;
+    const DACL: u32 = 0x04;
+
+    if descriptor.len() < HEADER {
+        return descriptor.to_vec();
+    }
+    let wanted = if mask == 0 { ALL } else { mask };
+    if wanted & DACL != 0 {
+        return descriptor.to_vec();
+    }
+    let dacl_offset = u32::from_le_bytes([
+        descriptor[16],
+        descriptor[17],
+        descriptor[18],
+        descriptor[19],
+    ]);
+    if dacl_offset == 0 {
+        return descriptor.to_vec();
+    }
+    let mut out = descriptor[..HEADER].to_vec();
+    let control = u16::from_le_bytes([out[2], out[3]]) & !SE_DACL_PRESENT;
+    out[2..4].copy_from_slice(&control.to_le_bytes());
+    out[16..20].copy_from_slice(&0u32.to_le_bytes());
+    out
+}
+
 /// A self-relative security descriptor with one DACL and two allow-ACEs.
 ///
 /// MS-DTYP §2.4.6 lays the header out as: revision, `sbz1`, control flags, four offsets into the
@@ -381,6 +423,35 @@ mod tests {
     /// Written out rather than trusted: a descriptor whose offsets are wrong is one a Windows client
     /// refuses to parse, and it says so with `ERROR_INVALID_ACL` somewhere far from the cause.
     #[test]
+    fn a_client_that_asks_for_the_dacl_alone_gets_it_alone() {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(security_descriptor())
+            .expect("the descriptor is base64");
+
+        // `4` is the DACL, and it is the only section this server puts in a descriptor.
+        assert_eq!(
+            security_descriptor_portions(&raw, 4),
+            raw,
+            "asking for the DACL must return the descriptor as it is"
+        );
+
+        // Asking for the owner alone means no DACL: the offset goes to zero and the present-bit
+        // comes off, because a receiver reads those two as the answer to "is a DACL here".
+        let stripped = security_descriptor_portions(&raw, 1);
+        assert_eq!(stripped.len(), 20, "only the header is left");
+        let control = u16::from_le_bytes([stripped[2], stripped[3]]);
+        assert_eq!(control & 0x0004, 0, "SE_DACL_PRESENT has to come off");
+        assert_eq!(
+            u32::from_le_bytes([stripped[16], stripped[17], stripped[18], stripped[19]]),
+            0,
+            "the Dacl offset has to be zero"
+        );
+
+        // Zero is not "no sections": a control with an empty mask asks for no preference.
+        assert_eq!(security_descriptor_portions(&raw, 0), raw);
+    }
+
     fn the_security_descriptor_is_well_formed() {
         use base64::Engine as _;
         let encoded = security_descriptor();

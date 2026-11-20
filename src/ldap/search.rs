@@ -971,6 +971,10 @@ fn search_root_dse(
                 .collect(),
         ))
         .push(crate::model::Attribute::single(
+            "vendorName",
+            env!("CARGO_PKG_NAME"),
+        ))
+        .push(crate::model::Attribute::single(
             "vendorVersion",
             env!("CARGO_PKG_VERSION"),
         ))
@@ -1067,6 +1071,13 @@ fn search_root_dse(
                     "domainFunctionality",
                     domain.emulation.functionality(),
                 ))
+                // The level of the controller itself. AD publishes three: the domain's, the forest's
+                // and this one, and a client that reads only the first two treats a controller that
+                // names none of its own as older than the domain it serves.
+                .push(crate::model::Attribute::single(
+                    "domainControllerFunctionality",
+                    domain.emulation.functionality(),
+                ))
                 .push(crate::model::Attribute::single(
                     "forestFunctionality",
                     domain.emulation.functionality(),
@@ -1096,6 +1107,14 @@ fn search_root_dse(
                 attributes = attributes.push(crate::model::Attribute::single(
                     "configurationNamingContext",
                     configuration,
+                ));
+                // The schema lives beside the configuration in the partition this server really has,
+                // and a client that reads `schemaNamingContext` and then the schema itself finds it
+                // there. Published from the same value the partition was created under, so the two
+                // cannot name different trees.
+                attributes = attributes.push(crate::model::Attribute::single(
+                    "schemaNamingContext",
+                    &format!("cn=Schema,{configuration}"),
                 ));
             }
             attributes
@@ -1288,6 +1307,7 @@ mod tests {
             attribute_names(&messages),
             vec![
                 "objectClass",
+                "vendorName",
                 "vendorVersion",
                 "supportedLDAPVersion",
                 "supportedControl",

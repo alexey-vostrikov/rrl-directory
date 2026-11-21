@@ -33,7 +33,44 @@ fn free_port() -> u16 {
     listener.local_addr().expect("an address").port()
 }
 
-fn config(port: u16, server_id: u16, peer: Option<u16>, path: &Path) -> String {
+/// The ports one node listens on. Handed in rather than picked here, because a node needs three
+/// of them and the caller is the one that knows which are free.
+#[derive(Clone, Copy)]
+struct Ports {
+    ldap: u16,
+    kerberos: u16,
+    smb: u16,
+}
+
+impl Ports {
+    fn free() -> Self {
+        Self {
+            ldap: free_port(),
+            kerberos: free_port(),
+            smb: free_port(),
+        }
+    }
+}
+
+/// Whether the node also answers on 88 and 445.
+///
+/// On, and this is the point of the file: `src/smb/serve.rs`, `kerberos/accounts.rs` and
+/// `kerberos/machine_password.rs` are reached only from the daemon's configuration - nothing calls
+/// them from a library test - so a node that serves LDAP alone leaves them at 0% coverage, and a
+/// quarter of `main.rs` untested with them. Turning the two listeners on costs a handful of high
+/// ports and exercises the wiring a join actually uses.
+fn listeners() -> &'static str {
+    "kerberos:\n  enabled: true\n  port: {kdc}\n  master_key_file: {key}\n\
+     smb:\n  enabled: true\n  port: {smb}\n  netbios_name: EXAMPLE\n  dns_domain: example.com\n"
+}
+
+fn config(
+    ports: Ports,
+    server_id: u16,
+    peer: Option<u16>,
+    path: &Path,
+    master_key: &Path,
+) -> String {
     let peers = match peer {
         None => String::new(),
         Some(peer_port) => format!(
@@ -41,16 +78,22 @@ fn config(port: u16, server_id: u16, peer: Option<u16>, path: &Path) -> String {
             3 - server_id
         ),
     };
+    let listeners = listeners()
+        .replace("{kdc}", &ports.kerberos.to_string())
+        .replace("{smb}", &ports.smb.to_string())
+        .replace("{key}", &master_key.display().to_string());
 
     format!(
         "base_dn: {BASE}\n\
-         listen_addr: 127.0.0.1:{port}\n\
+         listen_addr: 127.0.0.1:{}\n\
          backend: redb\n\
          backends:\n  redb:\n    path: {}\n\
          schema:\n  mode: off\n\
          server_id: {server_id}\n\
+         {listeners}\
          {peers}\
          access:\n  - subject: anonymous\n    attributes: [\"*\"]\n    rights: [read, search, compare, write]\n",
+        ports.ldap,
         path.display()
     )
 }
@@ -120,13 +163,19 @@ fn stop(child: &mut std::process::Child, log: &std::path::Path) {
 }
 
 /// Starts one node and waits until it accepts connections.
-fn start(port: u16, server_id: u16, peer: Option<u16>) -> Node {
+fn start(ports: Ports, server_id: u16, peer: Option<u16>) -> Node {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("dir.redb");
     let config_path = dir.path().join("config.yaml");
+    let master_key = dir.path().join("master.key");
+
+    // A realm with no `krbtgt` cannot issue a ticket, and the daemon refuses to start one without
+    // a master password to derive the key from. The password is a fixture, not a secret: it lives
+    // in the temporary directory with the store and goes away with it.
+    std::fs::write(&master_key, "replication test master key\n").expect("master key");
 
     let mut file = std::fs::File::create(&config_path).expect("config file");
-    file.write_all(config(port, server_id, peer, &path).as_bytes())
+    file.write_all(config(ports, server_id, peer, &path, &master_key).as_bytes())
         .expect("write config");
 
     let binary: PathBuf = env!("CARGO_BIN_EXE_rrl-directory").into();
@@ -142,7 +191,7 @@ fn start(port: u16, server_id: u16, peer: Option<u16>) -> Node {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if std::net::TcpStream::connect(("127.0.0.1", ports.ldap)).is_ok() {
             return Node {
                 child,
                 log,
@@ -155,7 +204,7 @@ fn start(port: u16, server_id: u16, peer: Option<u16>) -> Node {
     // The child is reaped before the panic: a process left running would hold its port and its
     // store file, and the next run would fail for a reason that belongs to this one.
     stop(&mut child, &log);
-    panic!("the server on port {port} never started listening");
+    panic!("the server on port {} never started listening", ports.ldap);
 }
 
 /// A search for one entry, the way a client builds it.
@@ -263,9 +312,10 @@ where
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_entry_written_on_one_node_appears_on_the_other() {
-    let (first, second) = (free_port(), free_port());
-    let a = start(first, 1, None);
-    let b = start(second, 2, Some(first));
+    let (a_ports, b_ports) = (Ports::free(), Ports::free());
+    let a = start(a_ports, 1, None);
+    let b = start(b_ports, 2, Some(a_ports.ldap));
+    let (first, second) = (a_ports.ldap, b_ports.ldap);
 
     add(first, "alice").await;
 
@@ -303,9 +353,10 @@ async fn a_deletion_reaches_the_other_node_too() {
     // The half a refresh cannot express. An entry that is gone leaves nothing behind, so a node
     // that only polls would keep it for ever - and in a full-mesh multi-master it cannot use "you
     // did not name it" either, because another node may have just created it.
-    let (first, second) = (free_port(), free_port());
-    let a = start(first, 1, None);
-    let b = start(second, 2, Some(first));
+    let (a_ports, b_ports) = (Ports::free(), Ports::free());
+    let a = start(a_ports, 1, None);
+    let b = start(b_ports, 2, Some(a_ports.ldap));
+    let (first, second) = (a_ports.ldap, b_ports.ldap);
 
     add(first, "bob").await;
     eventually("bob to reach the second node", || holds(second, "bob")).await;

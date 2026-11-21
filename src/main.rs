@@ -440,8 +440,14 @@ async fn serve() {
         fatal(&i18n::t(
             "error.backend",
             &[(
+                // The path is named here because it is the one thing the operator asked for: a
+                // message that says only "no `kdc` feature" leaves them wondering whether the file
+                // was found, and whether the flag they passed was the one that mattered.
                 "detail",
-                "this build has no `kdc` feature, so it has no keys to export",
+                &format!(
+                    "this build has no `kdc` feature, so it has no keys to export to {}",
+                    path.display()
+                ),
             )],
         ));
     }

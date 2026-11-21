@@ -294,14 +294,15 @@ mod tests {
         }
     }
 
+    // Gated on the feature rather than skipped inside: without the realm vocabulary there is no
+    // `krb5Principal` object class to validate against, so the test would have nothing to assert.
+    // A body that starts with `return` on one branch is unreachable code on that branch, and
+    // `clippy -D warnings` says so — which is how the CI lints this crate, with no features on.
+    #[cfg(feature = "kdc")]
     #[test]
     fn an_entry_shaped_like_a_realm_principal_carrying_an_nt_hash_validates() {
-        #[allow(unused_mut)]
         let mut schema = with_ad();
-        #[cfg(feature = "kdc")]
         crate::kerberos::schema::extend(&mut schema).expect("the realm vocabulary parses");
-        #[cfg(not(feature = "kdc"))]
-        return;
 
         let entry = entry(
             "krb5PrincipalName=alice@EXAMPLE.COM,krb5RealmName=EXAMPLE.COM,dc=example,dc=com",

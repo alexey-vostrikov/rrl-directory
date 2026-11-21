@@ -10,6 +10,12 @@
 //! schema it hands the dispatcher is the AD extension over the core, which is the schema an AD
 //! domain runs with.
 
+// The realm vocabulary is the `kdc` feature's, and so is `kerberos::schema`: without it this test has
+// no schema to check an account against. Gated rather than skipped inside, because `clippy
+// -D warnings` runs here with no features on — the configuration a plain LDAP server is built in —
+// and a test that cannot compile there is a red gate for a code path that is not even present.
+#![cfg(feature = "kdc")]
+
 use std::sync::Arc;
 
 use rasn::types::{OctetString, SetOf};

@@ -597,6 +597,7 @@ mod tests {
     /// Only what the acceptor reads: the signature, the type, empty name fields, the flags. The
     /// challenge it produces from this is not what this file checks - that the mechanism is
     /// reachable is - so the fixture is the smallest message the parser accepts.
+    #[cfg(feature = "kdc")]
     fn negotiate() -> Vec<u8> {
         let mut message = Vec::new();
         message.extend_from_slice(b"NTLMSSP\0");
@@ -607,6 +608,10 @@ mod tests {
         message
     }
 
+    #[cfg(feature = "kdc")]
+    // NTLM's keys come from the realm: without `kdc` this build cannot answer an NTLMSSP token,
+    // and the test asserts what it does answer. Gated, not skipped inside — a `return` on one
+    // branch is unreachable code there, and the CI lints this crate with no features on.
     #[test]
     fn ntlm_is_off_until_the_configuration_turns_it_on() {
         let directory = directory();

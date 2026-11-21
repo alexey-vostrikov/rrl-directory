@@ -21,3 +21,9 @@ ldappasswd
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/target
+mutants.out
+
+# A developer's own arrangement for building against locally checked-out siblings — the `[patch]`
+# blocks that used to sit in Cargo.toml and broke every clean checkout. Ignored, not committed: the
+# manifest has to describe a build that works from a bare clone.
+/.cargo/config.toml

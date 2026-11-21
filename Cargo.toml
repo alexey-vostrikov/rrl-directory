@@ -147,8 +147,21 @@ tower = { version = "0.5.3", features = ["util"] }
 [patch.crates-io]
 rasn-ldap = { path = "vendor/rasn-ldap" }
 
-[patch."https://github.com/alexey-vostrikov/rrl-smb"]
-smb-server = { path = "/sibling/rrl-smb" }
+# No `[patch]` on absolute paths below, deliberately.
+#
+# Two of these used to sit here, pointing at `/sibling/rrl-smb` and `/sibling/rrl-krb5`: they made a
+# container build against locally checked-out siblings work, and made every clean checkout fail with
+#
+#     patch location `/sibling/rrl-smb` does not contain packages matching `smb-server`
+#
+# which is what CI reported on every push. A patch in the manifest is part of the manifest, and a
+# checkout cannot opt out of it.
+#
+# A build against local siblings is a developer's arrangement, not the repository's. Pass it where
+# it belongs:
+#
+#     cargo --config 'patch."https://github.com/alexey-vostrikov/rrl-smb".smb-server.path="/sibling/rrl-smb"' \
+#           --config 'patch."https://github.com/alexey-vostrikov/krb5".krb5.path="/sibling/rrl-krb5"' build
+#
+# or put the same in `.cargo/config.toml`, which is ignored here for exactly this reason.
 
-[patch."https://github.com/alexey-vostrikov/krb5"]
-krb5 = { path = "/sibling/rrl-krb5" }

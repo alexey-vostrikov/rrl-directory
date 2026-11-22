@@ -72,6 +72,16 @@ jobs:
       - name: tests
         run: cargo test --all-targets
 
+      # The step above is the plain build: no realm, no SMB, no DNS - which is a plain LDAP server
+      # and a configuration worth testing. It is not the only one. The tests that need a feature are
+      # gated on it, so here they do not compile in; the replication tests do compile and then find
+      # no KDC or SMB listener to open, so the daemon never comes up and they fail for a reason that
+      # belongs to the build rather than to replication. This step is the other configuration, and
+      # the only one where those tests see the daemon they were written for: 1220 library tests
+      # against 1117, and two nodes converging.
+      - name: tests with every feature
+        run: cargo test --all-features --all-targets
+
   load:
     runs-on: ubuntu-latest
     timeout-minutes: 30

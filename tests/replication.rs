@@ -59,9 +59,37 @@ impl Ports {
 /// them from a library test - so a node that serves LDAP alone leaves them at 0% coverage, and a
 /// quarter of `main.rs` untested with them. Turning the two listeners on costs a handful of high
 /// ports and exercises the wiring a join actually uses.
-fn listeners() -> &'static str {
-    "kerberos:\n  enabled: true\n  port: {kdc}\n  master_key_file: {key}\n\
-     smb:\n  enabled: true\n  port: {smb}\n  netbios_name: EXAMPLE\n  dns_domain: example.com\n"
+///
+/// The listeners are the ones this build can open, and only those. The daemon refuses a
+/// configuration naming a listener it was not compiled with, and that is the right answer: a server
+/// that silently ignored a `kerberos:` section would look healthy while answering nothing on 88.
+/// Replication itself has nothing to do with either - two nodes converge over LDAP whatever else the
+/// process was built to do - so the fixture offers them only when they exist, and the test
+/// establishes the same thing in both builds. Before this it did not: in the plain build the daemon
+/// exited at startup and the report was "the server never started listening", which names the
+/// symptom and leaves the cause to a reader who already knows how the config is checked.
+fn listeners() -> String {
+    let kerberos = {
+        #[cfg(feature = "kdc")]
+        {
+            "kerberos:\n  enabled: true\n  port: {kdc}\n  master_key_file: {key}\n"
+        }
+        #[cfg(not(feature = "kdc"))]
+        {
+            ""
+        }
+    };
+    let smb = {
+        #[cfg(feature = "smb")]
+        {
+            "smb:\n  enabled: true\n  port: {smb}\n  netbios_name: EXAMPLE\n  dns_domain: example.com\n"
+        }
+        #[cfg(not(feature = "smb"))]
+        {
+            ""
+        }
+    };
+    format!("{kerberos}{smb}")
 }
 
 fn config(

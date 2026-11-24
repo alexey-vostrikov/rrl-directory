@@ -50,6 +50,9 @@ rc4 = "0.2"
 rasn = "0.30.0"
 rasn-ldap = "0.30.0"
 redb = "4.4.0"
+# An LSM tree whose durability is object storage. Optional: a directory on one host keeps redb, and
+# this is what a replica or a disposable host has to have instead.
+slatedb = { version = "0.18", optional = true }
 # The crypto layer: the NT hash and, in time, everything else this crate derives. One
 # implementation of a primitive, not one per consumer.
 rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = "main" }
@@ -132,6 +135,10 @@ kdc = ["dep:rrl-kdc"]
 smb = ["dep:smb-server"]
 # Port 53 and the zone a domain lives in: the `dnsRecord` values under `CN=RRLDNS`.
 dns = ["dep:hickory-server"]
+# The directory in an S3 bucket, `backends.<name>.type = "slate-s3"`: several servers on one store,
+# and a host that can be replaced without a copy of the data. Off by default: an object store puts
+# a 50 ms window in front of every durable write, which a directory on one host has no reason to take.
+slate-s3 = ["dep:slatedb"]
 
 [dev-dependencies]
 rrl-kdc = { git = "https://github.com/alexey-vostrikov/rrl-kdc", branch = "main" }

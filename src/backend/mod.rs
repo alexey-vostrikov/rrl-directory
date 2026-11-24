@@ -19,6 +19,9 @@ pub mod journal;
 pub mod null;
 pub mod redb_store;
 pub mod rest;
+/// The directory in an S3 bucket, for a store that outlives the host that wrote it.
+#[cfg(feature = "slate-s3")]
+pub mod slate_s3;
 /// What the directory needs from whatever stores it.
 pub mod store;
 
@@ -26,6 +29,8 @@ pub use file::FileBackend;
 pub use null::NullBackend;
 pub use redb_store::RedbBackend;
 pub use rest::RestBackend;
+#[cfg(feature = "slate-s3")]
+pub use slate_s3::SlateS3Backend;
 
 /// Directory payload as the backends hand it over.
 ///
@@ -161,6 +166,8 @@ pub enum BackendError {
     UpdateNotSupported,
     #[error("redb error on '{path}': {reason}")]
     Redb { path: String, reason: String },
+    #[error("object store error: {reason}")]
+    SlateS3 { reason: String },
     #[error("the REST service at '{url}' did not answer: {detail}")]
     Rest { url: String, detail: String },
     #[error("error building indexes: {0}")]
@@ -207,6 +214,8 @@ pub enum Backend {
     Null(NullBackend),
     Redb(RedbBackend),
     Rest(RestBackend),
+    #[cfg(feature = "slate-s3")]
+    SlateS3(SlateS3Backend),
 }
 
 impl Backend {
@@ -218,7 +227,12 @@ impl Backend {
     /// else's service; that is a different property, and asking this one is what keeps the
     /// refusal honest.
     pub fn stores_entries(&self) -> bool {
-        matches!(self, Backend::Redb(_))
+        match self {
+            Backend::Redb(_) => true,
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(_) => true,
+            _ => false,
+        }
     }
 
     /// Whether this backend can keep facts about the server itself: the domain SID, and the counter
@@ -228,7 +242,12 @@ impl Backend {
     /// entry certainly cannot hold a SID, and the ones that can hold entries all can. Kept as its own
     /// question so that a backend which one day stores entries without metadata answers honestly.
     pub fn keeps_meta(&self) -> bool {
-        matches!(self, Backend::Redb(_))
+        match self {
+            Backend::Redb(_) => true,
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(_) => true,
+            _ => false,
+        }
     }
 
     /// A value the server recorded about itself, or `None`.
@@ -238,6 +257,8 @@ impl Backend {
     pub fn meta_get(&self, key: &str) -> Result<Option<Vec<u8>>, BackendError> {
         match self {
             Backend::Redb(store) => store.meta_get(key),
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(store) => store.meta_get(key),
             // A backend with no place to keep it has never written one, which is the same answer as
             // an empty store.
             _ => Ok(None),
@@ -252,6 +273,8 @@ impl Backend {
     pub fn meta_set(&self, key: &str, value: &[u8]) -> Result<(), BackendError> {
         match self {
             Backend::Redb(store) => store.meta_set(key, value),
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(store) => store.meta_set(key, value),
             _ => Err(BackendError::UpdateNotSupported),
         }
     }
@@ -269,7 +292,23 @@ impl Backend {
     ) -> Result<Vec<crate::backend::redb_store::ChangeRecord>, BackendError> {
         match self {
             Backend::Redb(backend) => backend.journal_since(csn),
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend.journal_since(csn),
             _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Writes every pending change down now, where the backend keeps any pending.
+    ///
+    /// The redb store has none - `Durability::Immediate` means a commit has reached the file - and
+    /// the JSON backends write whole. An object store batches commits into a flush window, so a
+    /// caller about to exit, or an operator who has just been told the write is in the bucket, asks
+    /// here.
+    pub fn sync(&self) -> Result<(), BackendError> {
+        match self {
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend.sync(),
+            _ => Ok(()),
         }
     }
 
@@ -282,6 +321,11 @@ impl Backend {
     pub fn compact(&mut self) -> Result<Option<Compaction>, BackendError> {
         match self {
             Backend::Redb(backend) => Ok(Some(backend.compact()?)),
+            // Compaction belongs to the store: redb's is a rewrite this server asks for, and
+            // SlateDB's runs in its own compactor against the bucket. `None` is "nothing for the
+            // caller to do", not "this store never compacts".
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(_) => Ok(None),
             _ => Ok(None),
         }
     }
@@ -301,6 +345,8 @@ impl Backend {
     pub fn sequence(&self) -> Result<u64, BackendError> {
         match self {
             Backend::Redb(backend) => backend.sequence(),
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend.sequence(),
             _ => Ok(0),
         }
     }
@@ -393,6 +439,8 @@ impl Backend {
     pub fn journal_floor(&self) -> Result<Option<String>, BackendError> {
         match self {
             Backend::Redb(backend) => backend.journal_floor(),
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend.journal_floor(),
             _ => Ok(None),
         }
     }
@@ -401,6 +449,8 @@ impl Backend {
     pub fn journal_head(&self) -> Result<Option<String>, BackendError> {
         match self {
             Backend::Redb(backend) => backend.journal_head(),
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend.journal_head(),
             _ => Ok(None),
         }
     }
@@ -409,6 +459,8 @@ impl Backend {
     pub fn journal_prune(&self, keep: usize) -> Result<usize, BackendError> {
         match self {
             Backend::Redb(backend) => backend.journal_prune(keep),
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend.journal_prune(keep),
             _ => Ok(0),
         }
     }
@@ -420,6 +472,8 @@ impl Backend {
     ) -> Result<usize, BackendError> {
         match self {
             Backend::Redb(backend) => backend.journal_prune_before(cutoff),
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend.journal_prune_before(cutoff),
             _ => Ok(0),
         }
     }
@@ -448,7 +502,13 @@ impl Backend {
     /// store did. The incremental write path does - it patches memory with the entry it sent,
     /// which is only honest when the store kept that entry as given.
     pub fn keeps_entries_verbatim(&self) -> bool {
-        matches!(self, Backend::Redb(_))
+        match self {
+            Backend::Redb(_) => true,
+            // Written as one object and read back unchanged, like the redb store's one key.
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(_) => true,
+            _ => false,
+        }
     }
 
     pub fn name(&self) -> &'static str {
@@ -457,6 +517,8 @@ impl Backend {
             Backend::Null(_) => "null",
             Backend::Redb(_) => "redb",
             Backend::Rest(_) => "rest",
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(_) => "slate-s3",
         }
     }
 
@@ -485,6 +547,13 @@ impl Backend {
                 })?;
                 Ok(Backend::Redb(RedbBackend::from_config(config)?))
             }
+            #[cfg(feature = "slate-s3")]
+            "slate-s3" => {
+                let config = config.ok_or_else(|| BackendError::MissingConfig {
+                    name: name.to_string(),
+                })?;
+                Ok(Backend::SlateS3(SlateS3Backend::from_config(config)?))
+            }
             _ => Err(BackendError::UnknownBackend {
                 name: name.to_string(),
                 known: KNOWN_BACKENDS.to_vec(),
@@ -498,6 +567,8 @@ impl Backend {
             Backend::Null(backend) => backend.load(),
             Backend::Redb(backend) => backend.directory_data(),
             Backend::Rest(backend) => backend.load().await,
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend.directory_data().await,
         }
     }
 
@@ -508,6 +579,8 @@ impl Backend {
     pub fn entry_count(&self) -> Option<u64> {
         match self {
             Backend::Redb(backend) => backend.entry_count().ok(),
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend.entry_count().ok(),
             _ => None,
         }
     }
@@ -519,13 +592,24 @@ impl Backend {
     pub fn entry(&self, dn: &str) -> Option<Entry> {
         match self {
             Backend::Redb(backend) => backend.entry(dn).ok().flatten(),
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => {
+                // `entry` is synchronous on the seam and the store is not: the call blocks on one
+                // read, which is already what every synchronous method of this backend does.
+                backend.entry_blocking(dn).ok().flatten()
+            }
             _ => None,
         }
     }
 
     /// Whether a record can be read without walking the store.
     pub fn reads_by_key(&self) -> bool {
-        matches!(self, Backend::Redb(_))
+        match self {
+            Backend::Redb(_) => true,
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(_) => true,
+            _ => false,
+        }
     }
 
     pub async fn update(&self, change: &EntryChange) -> Result<(), BackendError> {
@@ -534,6 +618,11 @@ impl Backend {
             Backend::Null(backend) => backend.update(change),
             Backend::Redb(backend) => backend.apply(std::slice::from_ref(change)).map(|_| ()),
             Backend::Rest(backend) => backend.update(change).await,
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend
+                .apply(std::slice::from_ref(change))
+                .await
+                .map(|_| ()),
         }
     }
 
@@ -554,6 +643,10 @@ impl Backend {
             }
             Backend::Null(backend) => backend.update(&changes[0]).map(|()| None),
             Backend::Redb(backend) => backend.apply(changes).map(Some),
+            // One transaction and one commit: the entries, their journal records, the counter and
+            // the count move together, exactly as in the redb store.
+            #[cfg(feature = "slate-s3")]
+            Backend::SlateS3(backend) => backend.apply(changes).await.map(Some),
             Backend::Rest(backend) => {
                 // One request per object: HTTP has no change set, and the service's own
                 // transaction boundaries are the service's.
@@ -567,7 +660,13 @@ impl Backend {
 }
 
 /// Backends compiled into the binary, in the order they are reported.
+///
+/// `slate-s3` appears only where the feature is built: a name an operator can configure and that
+/// then fails at start is worse than a name the error message never offered.
+#[cfg(not(feature = "slate-s3"))]
 pub const KNOWN_BACKENDS: [&str; 4] = ["file", "null", "redb", "rest"];
+#[cfg(feature = "slate-s3")]
+pub const KNOWN_BACKENDS: [&str; 5] = ["file", "null", "redb", "rest", "slate-s3"];
 
 #[cfg(test)]
 mod tests {
@@ -577,9 +676,18 @@ mod tests {
     fn unknown_backend_lists_the_known_ones() {
         let err = Backend::from_config("postgres", None).expect_err("must reject");
 
+        // Against the constant, not a hand-written list: which backends a build has depends on its
+        // features, and a test that spelled the list out failed the moment `slate-s3` was built.
         assert_eq!(
             err.to_string(),
-            "unknown backend 'postgres', known backends: file, null, redb, rest"
+            format!(
+                "unknown backend 'postgres', known backends: {}",
+                KNOWN_BACKENDS.join(", ")
+            )
+        );
+        assert!(
+            KNOWN_BACKENDS.contains(&"redb"),
+            "the entry store is in every build"
         );
     }
 

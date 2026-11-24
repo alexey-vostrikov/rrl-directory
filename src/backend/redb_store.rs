@@ -71,7 +71,7 @@ struct StoredAttribute {
 /// A change that arrives without one gets a fresh CSN here rather than no record: a journal entry
 /// with no key cannot be ordered, and a change that happened is not made un-happened by the
 /// absence of a stamp.
-fn csn_of(entry: &Entry) -> String {
+pub(crate) fn csn_of(entry: &Entry) -> String {
     entry
         .attributes()
         .get(crate::operational::ATTR_ENTRY_CSN)
@@ -80,7 +80,7 @@ fn csn_of(entry: &Entry) -> String {
 }
 
 /// The identity a replica knows the entry by.
-fn uuid_of(entry: &Entry) -> String {
+pub(crate) fn uuid_of(entry: &Entry) -> String {
     entry
         .attributes()
         .get(crate::model::ATTR_ENTRY_UUID)

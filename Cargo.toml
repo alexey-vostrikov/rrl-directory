@@ -111,12 +111,16 @@ rrl-kdc = { git = "https://github.com/alexey-vostrikov/rrl-kdc", branch = "main"
 # `\\DC\IPC$` and opens `lsarpc` through it. Without `localfs` - this server serves no files - and
 # with `krb5`, so a machine account can authenticate with the ticket it already has.
 #
-# From the fork, on the branch that carries what a join needs: `lsarpc`, `samr` and Kerberos in
-# SESSION_SETUP do not exist in the upstream release, and a path dependency on a sibling checkout
-# resolves to "no such package" on any machine that cloned this repository alone. `branch` rather
-# than `rev` for the same reason as `rrl-kdc` above; `cargo update -p smb-server` takes a newer
-# revision. Move this back to `paltaio/rust-smb-server` once that branch is merged upstream.
-smb-server = { git = "https://github.com/alexey-vostrikov/rrl-smb", branch = "krb5-support", optional = true, default-features = false, features = ["krb5"] }
+# From the fork, on its `main`: `lsarpc`, `samr` and Kerberos in SESSION_SETUP do not exist in the
+# upstream release, and a path dependency on a sibling checkout resolves to "no such package" on any
+# machine that cloned this repository alone. `branch` rather than `rev` for the same reason as
+# `rrl-kdc` above; `cargo update -p smb-server` takes a newer revision. Move this back to
+# `paltaio/rust-smb-server` once that work is merged upstream.
+#
+# `ipc` is named beside `krb5` because it is off by default: the pipes - `IPC$`, its named channels
+# and the DCE/RPC on them - are the whole reason this daemon runs an SMB server at all, and a build
+# that left them out would answer `BAD_NETWORK_NAME` to the first thing a join asks for.
+smb-server = { git = "https://github.com/alexey-vostrikov/rrl-smb", branch = "main", optional = true, default-features = false, features = ["krb5", "ipc"] }
 
 # Logging. `tracing` without a subscriber records nothing, and the call sites look instrumented
 # either way - which is how a refusal in the RPC dispatcher came to be invisible. The subscriber

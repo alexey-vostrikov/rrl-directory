@@ -38,6 +38,29 @@ fn now() -> u64 {
         .as_secs()
 }
 
+/// A copy of a fixture that only this process can read.
+///
+/// A git checkout cannot carry a file mode - the index stores 644 or 755 and nothing else - so the
+/// fixture in the repository arrives readable by everybody, which is exactly what the loader refuses.
+/// The copy is what makes the check testable rather than a CI failure, and it keeps the production
+/// rule strict: a real signing key on a real host is `0600` or the server will not start.
+fn key_file(fixture: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = std::env::temp_dir().join(format!("rrl-dnssec-keys-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("a temporary directory");
+    let target = directory.join(fixture);
+    if !target.exists() {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/keys")
+            .join(fixture);
+        std::fs::copy(&source, &target).expect("the fixture is committed");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("the mode can be set");
+    }
+    target
+}
+
 /// The P-256 key committed beside this test, as PKCS#8 DER.
 ///
 /// A test key, and it says so in its name: it signs nothing outside this suite. Generating one per
@@ -55,10 +78,7 @@ fn now() -> u64 {
 /// `InvalidEncoding` - measured. The `pkcs8 -topk8` pass is what puts the `AlgorithmIdentifier` in
 /// front and makes it the format the documentation promises.
 fn key_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("keys")
-        .join("rrl-dnssec-test-p256.der")
+    key_file("rrl-dnssec-test-p256.der")
 }
 
 fn signers() -> Signers {
@@ -477,6 +497,78 @@ fn the_nsec3_chain_is_signed_and_its_signatures_verify() {
         dnskey
             .verify_rrsig(&link.name, DNSClass::IN, &rrsig, std::iter::once(*link))
             .unwrap_or_else(|err| panic!("the NSEC3 signature at {owner} must verify: {err}"));
+    }
+}
+
+/// All three algorithms this build signs with: 13, 14 and 15.
+///
+/// The task's acceptance names them, and a build that quietly signs with one of the three is a build
+/// whose "algorithms 13/14/15" is a claim about the enum rather than about the wire. Each is loaded
+/// from its own fixture, signed with, and verified by `hickory`'s verifier over the records.
+#[test]
+fn every_algorithm_this_build_offers_signs_and_verifies() {
+    for (name, fixture, expected) in [
+        ("13", "rrl-dnssec-test-p256.der", 13u8),
+        ("14", "rrl-dnssec-test-p384.der", 14),
+        ("15", "rrl-dnssec-test-ed25519.der", 15),
+    ] {
+        let signers = Signers::new(
+            &DnssecConfig {
+                keys: vec![KeyConfig {
+                    algorithm: name.to_string(),
+                    file: key_file(fixture),
+                }],
+                signature_days: None,
+                nsec3: None,
+            },
+            DOMAIN,
+        )
+        .unwrap_or_else(|err| panic!("algorithm {name} has to load: {err}"));
+
+        let signed = signers
+            .sign(&records(), now())
+            .unwrap_or_else(|err| panic!("algorithm {name} has to sign: {err}"));
+
+        let dnskey = signed
+            .iter()
+            .find_map(|record| match &record.data {
+                RData::DNSSEC(DNSSECRData::DNSKEY(key)) => Some(key.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("algorithm {name} publishes a DNSKEY"));
+        assert_eq!(
+            u8::from(dnskey.algorithm()),
+            expected,
+            "the published key names algorithm {expected}"
+        );
+
+        let host = format!("host.{DOMAIN}.");
+        let rrsig = signed
+            .iter()
+            .find_map(|record| match &record.data {
+                RData::DNSSEC(DNSSECRData::RRSIG(sig))
+                    if record.name.to_ascii() == host
+                        && sig.input().type_covered == RecordType::A =>
+                {
+                    Some(sig.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("algorithm {name} signs host's A"));
+        let covered = signed
+            .iter()
+            .find(|record| record.name.to_ascii() == host && record.record_type() == RecordType::A)
+            .expect("the record the signature covers")
+            .clone();
+
+        dnskey
+            .verify_rrsig(
+                &Name::from_ascii(host.clone()).expect("a name"),
+                DNSClass::IN,
+                &rrsig,
+                std::iter::once(&covered),
+            )
+            .unwrap_or_else(|err| panic!("algorithm {name} must verify: {err}"));
     }
 }
 

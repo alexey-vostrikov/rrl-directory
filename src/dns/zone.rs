@@ -150,7 +150,13 @@ impl Zone {
 
         let mut records = Vec::new();
         let mut unserved = Vec::new();
-        for (_, entry) in directory.scope_matches(&dn, Scope::OneLevel, |_| true) {
+        // `records_in_scope` and not `scope_matches`: on a snapshot that holds skeletons - which is
+        // what a restart on the store produces - the entries there are identities with no
+        // attributes, and the owner of every record lives in one (`dc`). Reading them from
+        // `scope_matches` answered "carries no 'dc'" for the apex of a zone the same process had
+        // just written, and the server refused to start on its own data.
+        for (_, entry) in directory.records_in_scope(&dn, Scope::OneLevel) {
+            let entry = entry.as_ref();
             let relative = relative_name(entry)?;
             let owner = match relative.as_str() {
                 APEX => origin.clone(),
@@ -351,6 +357,7 @@ pub fn node_entry(
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
 
     use super::*;
     use crate::dns::record::{Record as Stored, Soa, Srv};
@@ -500,6 +507,77 @@ mod tests {
         let read = Zone::read(&directory, BASE, DOMAIN).expect("the zone reads");
         assert!(read.records.is_empty(), "nothing renderable was stored");
         assert_eq!(read.unserved, vec![TXT]);
+    }
+
+    /// The same directory as a restart on the store finds it: identities in the snapshot, records in
+    /// the store, one keyed read away.
+    ///
+    /// This is what `reload` builds out of `index.skeletons`, and it is the state the zone reader
+    /// was never tested against - every other test hands it `from_entries`, where the attributes are
+    /// right there.
+    fn restarted(full: &Directory) -> Directory {
+        /// The store, as `Backend::entry` sees it: one DN, one record.
+        struct Store(std::collections::HashMap<String, Entry>);
+
+        impl crate::directory::EntrySource for Store {
+            fn get(&self, dn: &str) -> Option<Entry> {
+                self.0.get(&crate::dn::normalize(dn)).cloned()
+            }
+        }
+
+        let store: std::collections::HashMap<String, Entry> = full
+            .entries_with_ids(BASE, Scope::Subtree)
+            .into_iter()
+            .map(|(_, entry)| (crate::dn::normalize(entry.dn()), entry.clone()))
+            .collect();
+        assert!(!store.is_empty(), "the store has to hold something to read");
+
+        let mut snapshot = full.clone();
+        snapshot.release_records();
+        snapshot.with_source(Arc::new(Store(store)))
+    }
+
+    /// A server that restarts on its own store has to serve the same zone it wrote.
+    ///
+    /// It did not: the snapshot after a restart holds identities with no attributes, the reader took
+    /// `entry.attributes().get("dc")` from those, and the apex failed with "carries no 'dc'" - a
+    /// domain controller that could not start twice on the data it had just provisioned. The
+    /// snapshot is the data here, not a mock: `release_records` empties exactly the attributes that
+    /// `reload` never fills in.
+    #[test]
+    fn a_zone_reads_out_of_a_snapshot_that_holds_only_identities() {
+        let full = directory();
+        let restarted = restarted(&full);
+        assert!(
+            restarted.is_skeleton(),
+            "the premise: this snapshot holds identities, not records"
+        );
+
+        let expected = Zone::read(&full, BASE, DOMAIN).expect("the zone reads from records");
+        let read = Zone::read(&restarted, BASE, DOMAIN).expect("the zone reads from identities");
+
+        let describe = |zone: &Zone| {
+            let mut seen: Vec<(String, u16, u32)> = zone
+                .records
+                .iter()
+                .map(|record| {
+                    (
+                        record.name.to_ascii(),
+                        u16::from(record.record_type()),
+                        record.ttl,
+                    )
+                })
+                .collect();
+            seen.sort();
+            seen
+        };
+        assert_eq!(
+            describe(&read),
+            describe(&expected),
+            "a restart answers with the zone it wrote: same names, types and TTLs"
+        );
+        assert_eq!(read.unserved, expected.unserved);
+        assert_eq!(read.dn, expected.dn);
     }
 
     /// A node whose `dc` is missing cannot be placed anywhere, and guessing would attach a record

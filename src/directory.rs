@@ -829,6 +829,11 @@ impl Directory {
 
     /// The entries in scope whose record satisfies `keep`, compared on normalised DNs.
     ///
+    /// The entries are what the snapshot holds: complete records, or identities with no attributes
+    /// when the snapshot is a skeleton. That is enough to decide *which* entries are in scope and
+    /// wrong for anything that reads a value - use [`Self::records_in_scope`] for that, or
+    /// [`Self::record`] for one DN.
+    ///
     /// Both sides are normalised here. The base always was, and the entry's DN never - so a search
     /// for `cn=Configuration,…` found nothing at all, not even the entry itself, while the same entry
     /// appeared in a search from the domain above it. Case only shows up on a DN that has an upper-case
@@ -848,6 +853,22 @@ impl Directory {
             .filter(|(_, entry)| in_scope_for(entry.dn(), &base_object, scope))
             .filter(|(_, entry)| keep(entry))
             .collect()
+    }
+
+    /// The records in scope, with their attributes, whichever kind of snapshot this is.
+    ///
+    /// `scope_matches` answers with what the snapshot holds - identities only when it is a skeleton -
+    /// which is enough to decide *which* entries are in scope and not enough to read a value out of
+    /// them. Everything that walks a subtree for its records needs the second, and silently got the
+    /// first: a zone reader took `entry.attributes()` and found nothing, so a server that had
+    /// restarted on its own store refused to start with "carries no 'dc'". `resolved_at` is the path
+    /// a search already takes for the same reason; this is it with the scope applied.
+    pub fn records_in_scope(
+        &self,
+        base_object: &str,
+        scope: Scope,
+    ) -> Vec<(usize, std::borrow::Cow<'_, Entry>)> {
+        self.resolved_at(&self.scope_ids(base_object, scope))
     }
 
     /// The entries at the given positions, in ascending order.

@@ -376,7 +376,11 @@ fn is_domain_name(text: &str) -> bool {
 /// derives a name from the same input, and a shared helper would have to live in a module none of
 /// them owns. Three lines of `dc=` parsing that disagree is what a test catches; a module boundary
 /// does not.
-fn domain_of_base(base_dn: &str) -> Option<String> {
+/// The DNS name a naming context spells: `dc=ad,dc=example,dc=com` is `ad.example.com`.
+///
+/// Public because the group policy half needs the same name to spell a share path, and two
+/// implementations of this would be two answers to one question.
+pub fn domain_of_base(base_dn: &str) -> Option<String> {
     let mut labels = Vec::new();
     for rdn in base_dn.split(',') {
         let (kind, value) = rdn.split_once('=')?;

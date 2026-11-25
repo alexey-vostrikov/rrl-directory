@@ -302,6 +302,19 @@ pub async fn start(
         }
     }
 
+    // The domain's two default policies, on the directory half. A client reads the
+    // `groupPolicyContainer` before it fetches any template, so a controller without them answers
+    // `gpresult /r` with nothing at all - which reads as an unmanaged domain rather than as a policy
+    // that was never made. The template half is the policy share, which this build does not serve.
+    match crate::gpo::ensure(&source, &base_dn).await? {
+        crate::gpo::Outcome::Created(dns) => {
+            for dn in dns {
+                eprintln!("gpo: provisioned {dn}");
+            }
+        }
+        crate::gpo::Outcome::AlreadyThere => {}
+    }
+
     let view = Arc::new(super::realm::RealmView::new(
         settings.realm.clone(),
         base_dn.clone(),

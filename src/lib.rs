@@ -37,6 +37,7 @@ pub mod dn;
 #[cfg(feature = "dns")]
 pub mod dns;
 pub mod emulation;
+pub mod gpo;
 pub mod http;
 pub mod i18n;
 pub mod import;

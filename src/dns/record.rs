@@ -47,6 +47,7 @@ pub mod kind {
     pub const SOA: u16 = 0x0006;
     pub const PTR: u16 = 0x000C;
     pub const MX: u16 = 0x000F;
+    pub const TXT: u16 = 0x0010;
     pub const AAAA: u16 = 0x001C;
     pub const DNAME: u16 = 0x0027;
     pub const SRV: u16 = 0x0021;
@@ -82,6 +83,12 @@ pub enum Data {
         exchange: String,
     },
     Srv(Srv),
+    /// One or more character-strings, RFC 1035 §3.3.14.
+    ///
+    /// A list and not one string because the wire form is a list: a `TXT` may carry several strings,
+    /// and a server that joined them would answer with a value the client did not write. This is the
+    /// type a `_acme-challenge` record uses, which is why it is here rather than among `Other`.
+    Txt(Vec<String>),
     /// A tombstoned record: `DNS_TYPE_ZERO`, the timestamp it was deleted at, in FILETIME units.
     Tombstone(u64),
     /// A type this build does not read, carried through unchanged.
@@ -209,6 +216,7 @@ impl Record {
                 | (Data::Soa(_), kind::SOA)
                 | (Data::Mx { .. }, kind::MX)
                 | (Data::Srv(_), kind::SRV)
+                | (Data::Txt(_), kind::TXT)
                 | (Data::Tombstone(_), kind::ZERO)
                 | (
                     Data::Name(_),
@@ -337,6 +345,43 @@ fn decode_data(rtype: u16, data: &[u8]) -> Result<Data, Error> {
                 target,
             }))
         }
+        kind::TXT => {
+            // `u8 count`, then that many `u8 len` + octets. An empty value is `count 0`, which some
+            // tools write to say "this name exists with no text"; it is kept as an empty list.
+            let Some((&count, mut rest)) = data.split_first() else {
+                return Err(Error::DataLength {
+                    kind: rtype,
+                    expected: 1,
+                    got: 0,
+                });
+            };
+            let mut strings = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let Some((&length, tail)) = rest.split_first() else {
+                    return Err(Error::DataLength {
+                        kind: rtype,
+                        expected: count as usize * 2,
+                        got: data.len(),
+                    });
+                };
+                let length = length as usize;
+                if tail.len() < length {
+                    return Err(Error::DataLength {
+                        kind: rtype,
+                        expected: length,
+                        got: tail.len(),
+                    });
+                }
+                // Octets, not UTF-8: a `TXT` is arbitrary and an ACME token is base64url, but a
+                // client is free to write binary and losing it here would lose the record.
+                strings.push(String::from_utf8_lossy(&tail[..length]).to_string());
+                rest = &tail[length..];
+            }
+            if !rest.is_empty() {
+                return Err(Error::TrailingBytes(rest.len()));
+            }
+            Ok(Data::Txt(strings))
+        }
         kind::ZERO => {
             fixed(8)?;
             let mut octets = [0u8; 8];
@@ -372,6 +417,24 @@ fn encode_data(data: &Data) -> Result<Vec<u8>, Error> {
             out.extend_from_slice(&srv.weight.to_be_bytes());
             out.extend_from_slice(&srv.port.to_be_bytes());
             write_name(&srv.target, &mut out)?;
+        }
+        Data::Txt(strings) => {
+            let count = u8::try_from(strings.len()).map_err(|_| Error::DataLength {
+                kind: kind::TXT,
+                expected: usize::from(u8::MAX),
+                got: strings.len(),
+            })?;
+            out.push(count);
+            for text in strings {
+                let bytes = text.as_bytes();
+                let length = u8::try_from(bytes.len()).map_err(|_| Error::DataLength {
+                    kind: kind::TXT,
+                    expected: usize::from(u8::MAX),
+                    got: bytes.len(),
+                })?;
+                out.push(length);
+                out.extend_from_slice(bytes);
+            }
         }
         Data::Tombstone(time) => out.extend_from_slice(&time.to_le_bytes()),
         Data::Other(raw) => out.extend_from_slice(raw),

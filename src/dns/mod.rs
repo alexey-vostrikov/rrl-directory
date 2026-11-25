@@ -28,4 +28,5 @@ pub mod provision;
 pub mod record;
 pub mod serve;
 pub mod tsig;
+pub mod update;
 pub mod zone;

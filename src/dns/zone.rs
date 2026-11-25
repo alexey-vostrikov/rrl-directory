@@ -261,6 +261,11 @@ fn render(owner: &Name, record: &record::Record) -> Option<Record> {
             srv.port,
             absolute(&srv.target)?,
         )),
+        // A `TXT` is what a `_acme-challenge` record is, and what an SPF or DKIM record is: the one
+        // type a client writes into a zone and then reads back to prove it may have it.
+        Data::Txt(strings) => {
+            RData::TXT(hickory_server::proto::rr::rdata::TXT::new(strings.clone()))
+        }
         // Tombstones are deletions the zone keeps as markers, and `Other` is everything this build
         // does not read. Neither belongs on the wire.
         Data::Tombstone(_) | Data::Other(_) => return None,
@@ -364,9 +369,10 @@ mod tests {
 
     const BASE: &str = "dc=ad,dc=example,dc=com";
 
-    /// `TXT`, `1.2.840.113556.1.4.382`'s most common neighbour in a domain zone, and a type
-    /// [`Data`] keeps as `Other`.
-    const TXT: u16 = 0x0010;
+    /// `HTTPS` (type 65), a type this build keeps as `Data::Other` and cannot render onto the wire.
+    /// `TXT` was the example until this build learned to read it, which is exactly the kind of drift
+    /// a test that names a type rather than asking for one does not survive.
+    const UNRENDERED: u16 = 0x0041;
     const DOMAIN: &str = "ad.example.com";
 
     fn soa() -> Data {
@@ -489,24 +495,24 @@ mod tests {
         }
     }
 
-    /// A type this build cannot render is reported, not dropped: a zone that silently loses its
-    /// `TXT` values answers NXDOMAIN for names it holds.
+    /// A type this build cannot render is reported, not dropped: a zone that silently loses the
+    /// records it cannot answer for is a zone that answers NXDOMAIN for names it holds.
     #[test]
     fn a_record_this_build_cannot_render_is_counted() {
         let zone = zone_entry(BASE, DOMAIN, 0, 0);
         let dn = zone.dn().to_string();
         // A type this build does not read: `Data::Other` keeps the octets, and the listener has
         // nothing to put on the wire for them.
-        let txt = Stored::zone(TXT, 600, Data::Other(vec![9, 1, 2, 3]));
+        let other = Stored::zone(UNRENDERED, 600, Data::Other(vec![9, 1, 2, 3]));
         let entries = vec![
             zone,
-            node_entry(&dn, "txt", std::slice::from_ref(&txt)).expect("it encodes"),
+            node_entry(&dn, "other", std::slice::from_ref(&other)).expect("it encodes"),
         ];
         let directory = Directory::from_entries(BASE, "users", "groups", entries);
 
         let read = Zone::read(&directory, BASE, DOMAIN).expect("the zone reads");
         assert!(read.records.is_empty(), "nothing renderable was stored");
-        assert_eq!(read.unserved, vec![TXT]);
+        assert_eq!(read.unserved, vec![UNRENDERED]);
     }
 
     /// The same directory as a restart on the store finds it: identities in the snapshot, records in

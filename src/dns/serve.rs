@@ -275,6 +275,17 @@ pub trait ZoneSource: Send + Sync {
     async fn keys(&self) -> Arc<crate::dns::tsig::Keys> {
         Arc::new(crate::dns::tsig::Keys::none())
     }
+
+    /// Applies one RFC 2136 update message, or says why not.
+    ///
+    /// Default: refused. A source with no directory to write to cannot register anything, and
+    /// `NotImp` is the honest code rather than a silent success.
+    async fn apply_update(
+        &self,
+        _updates: &[Record],
+    ) -> Result<crate::dns::update::Plan, ResponseCode> {
+        Err(ResponseCode::NotImp)
+    }
 }
 
 /// The zone read out of this server's own directory, one read per query.
@@ -341,6 +352,43 @@ impl ZoneSource for InDirectory {
                 Arc::new(crate::dns::tsig::Keys::none())
             }
         }
+    }
+
+    /// Decides the update against the zone as it stands, then applies the whole change set through
+    /// the funnel every other write uses - one transaction, the journal, the schema, replication.
+    ///
+    /// The plan is made against one read of the directory and applied to whatever is there when the
+    /// write lands. That window is the same one any read-then-write takes, and it is closed by the
+    /// grant check and by the fact that a zone has one writer: `Source::apply` serialises.
+    async fn apply_update(
+        &self,
+        updates: &[hickory_server::proto::rr::Record],
+    ) -> Result<crate::dns::update::Plan, ResponseCode> {
+        let zone_dn = crate::dns::zone::zone_dn(&self.base_dn, &self.dns_name);
+        let directory = self.source.directory().await;
+        let plan = crate::dns::update::plan(&directory, &zone_dn, &self.dns_name, updates)?;
+
+        let changes: Vec<crate::backend::EntryChange> = plan
+            .changes
+            .iter()
+            .map(|change| match change {
+                crate::dns::update::Change::Put { entry, .. } => {
+                    crate::backend::EntryChange::Upsert {
+                        entry: entry.clone(),
+                    }
+                }
+                crate::dns::update::Change::Remove { dn } => crate::backend::EntryChange::Delete {
+                    dn: dn.clone(),
+                    kind: None,
+                },
+            })
+            .collect();
+
+        self.source.apply(&changes).await.map_err(|err| {
+            tracing::error!(%err, "dns: the update could not be written to the directory");
+            ResponseCode::ServFail
+        })?;
+        Ok(plan)
     }
 }
 
@@ -497,11 +545,33 @@ impl ZoneHandler for FromSource {
         update: &Request,
         now: u64,
     ) -> (Result<bool, ResponseCode>, Option<TSigResponseContext>) {
+        // The order is the whole point of this body: the signature is checked first, so a key that
+        // does not verify earns `NOTAUTH` with the TSIG error that says why, and only a client that
+        // proved itself reaches the update itself. A client told `NOTAUTH` when the real problem was
+        // something else would go and rewrite a key that is fine.
         let keys = self.source.keys().await;
         let (verdict, signer) = keys.authorize(update, now);
-        match verdict {
+        if let Err(code) = verdict {
+            return (Err(code), signer);
+        }
+
+        // An unsigned update is refused, and the decision is recorded here because the task asked
+        // for one: `REFUSED` says "this server does not take an unsigned update", which is a policy
+        // the client can act on, while `NOTAUTH/BADKEY` would say a key was wrong - and there was no
+        // key. A zone in a domain is changed only by a client that proved which key it speaks for.
+        if signer.is_none() {
+            tracing::warn!("dns: an unsigned update was refused");
+            return (Err(ResponseCode::Refused), None);
+        }
+
+        match self.source.apply_update(&update.authorities).await {
+            Ok(plan) => {
+                for line in &plan.applied {
+                    tracing::info!(key = ?signer.as_ref().map(|_| "signed"), op = %line, serial = plan.serial, "dns: update applied");
+                }
+                (Ok(true), signer)
+            }
             Err(code) => (Err(code), signer),
-            Ok(()) => (Err(ResponseCode::Refused), signer),
         }
     }
 

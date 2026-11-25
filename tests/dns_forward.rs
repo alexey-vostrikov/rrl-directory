@@ -126,6 +126,9 @@ fn settings(
         forward_default,
         forward_zones,
         zones_dir: std::path::PathBuf::from("/dns"),
+        // No keys: this suite is about the forwarder, and a signed request it never sends cannot
+        // be verified by anything.
+        keys: Vec::new(),
     }
 }
 

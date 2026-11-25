@@ -26,4 +26,5 @@ pub mod property;
 pub mod provision;
 pub mod record;
 pub mod serve;
+pub mod tsig;
 pub mod zone;

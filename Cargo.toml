@@ -35,7 +35,12 @@ humantime = "2.4.0"
 # place to be wrong about compression and message structure. `default-features = false` because the
 # resolver, sqlite store and TOML configuration are not wanted: the zone lives in this server's own
 # directory. MSRV 1.88, below the toolchain pinned here.
-hickory-server = { version = "0.26.3", default-features = false, optional = true }
+# `dnssec-ring` and not the SQLite store: it is the feature that carries `TSigner` and the TSIG
+# buffer layout (RFC 8945) as well as the DNSSEC signing keys RRL-2.25.9 needs. `ring` is already in
+# this dependency tree through rustls, so the feature adds no new crypto.
+hickory-server = { version = "0.26.3", default-features = false, features = [
+    "dnssec-ring",
+], optional = true }
 # The one place this crate steps outside safe Rust, and only to map a file it owns: see
 # `src/index_file.rs`. Everything else - protocol parsing, TLS, HTTP, storage - is safe code.
 memmap2 = "0.9"

@@ -48,6 +48,9 @@ const TCP_BUFFER: usize = 1232;
 pub struct InMemory {
     origin: Option<LowerName>,
     records: Vec<Record>,
+    /// The keys a signed request may use. Empty unless somebody set them, which is what a test and
+    /// a stand without keys look like.
+    keys: Arc<crate::dns::tsig::Keys>,
 }
 
 impl InMemory {
@@ -60,7 +63,15 @@ impl InMemory {
         Some(Self {
             origin: Some(origin),
             records,
+            keys: Arc::new(crate::dns::tsig::Keys::none()),
         })
+    }
+
+    /// The same zone, checking signatures against `keys`.
+    #[must_use]
+    pub fn with_keys(mut self, keys: Arc<crate::dns::tsig::Keys>) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// The answer to a lookup, in the shape the trait wants.
@@ -175,15 +186,62 @@ impl ZoneHandler for InMemory {
         request: &Request,
         lookup_options: LookupOptions,
     ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
+        // The signature first: a request that cannot prove which key it speaks for is not one to
+        // answer from the zone. The context goes back with the refusal, because RFC 8945 wants even
+        // that answer to carry a TSIG - bare for `BADKEY`/`BADSIG`, signed for `BADTIME`.
+        let (verdict, signer) = self.keys.authorize(request, crate::dns::tsig::now());
+        if let Err(code) = verdict {
+            return (
+                LookupControlFlow::Continue(Err(LookupError::ResponseCode(code))),
+                signer,
+            );
+        }
+
         // `Request` derefs to its `MessageRequest`, which carries the queries it was parsed from.
         // A request with no query at all is a form the caller has already rejected; answering
         // `Skip` here hands it to the next zone instead of inventing a name.
         let Some(question) = request.queries.queries().first() else {
-            return (LookupControlFlow::Skip, None);
+            return (LookupControlFlow::Skip, signer);
         };
         let name = question.name().clone();
         let rtype = question.query_type();
-        (self.answer(&name, rtype, lookup_options), None)
+        (self.answer(&name, rtype, lookup_options), signer)
+    }
+
+    /// RFC 2136 `OPCODE=5`. Verifies the signature and refuses the update: the machine that turns
+    /// the message into `dnsRecord` writes is RRL-2.25.8, and a half-implemented one would answer
+    /// `NOERROR` without changing anything - the one answer a client must never get.
+    ///
+    /// The signature is checked **before** that refusal on purpose. A key that does not verify earns
+    /// `NOTAUTH` with `BADKEY`/`BADSIG`/`BADTIME`, which is a different statement from "this server
+    /// does not accept updates", and a client that got the second could stop trying to fix a key that
+    /// is actually wrong.
+    async fn update(
+        &self,
+        update: &Request,
+        now: u64,
+    ) -> (Result<bool, ResponseCode>, Option<TSigResponseContext>) {
+        let (verdict, signer) = self.keys.authorize(update, now);
+        match verdict {
+            Err(code) => (Err(code), signer),
+            Ok(()) => (Err(ResponseCode::Refused), signer),
+        }
+    }
+
+    async fn nsec3_records(
+        &self,
+        _info: hickory_server::zone_handler::Nsec3QueryInfo<'_>,
+        _lookup_options: LookupOptions,
+    ) -> LookupControlFlow<AuthLookup> {
+        // A zone with no NSEC3PARAM holds no chain to walk: `Skip` hands the question to the next
+        // handler, which is the honest answer for a zone that does not sign (RRL-2.25.10).
+        LookupControlFlow::Skip
+    }
+
+    fn nx_proof_kind(&self) -> Option<&hickory_server::dnssec::NxProofKind> {
+        // Nothing to prove absence with: the zone is not signed, and claiming a proof kind would
+        // make the catalog ask for records that do not exist.
+        None
     }
 
     async fn nsec_records(
@@ -253,6 +311,8 @@ pub struct FromSource {
     origin: LowerName,
     /// What the last successful read returned, for the case above.
     last: std::sync::Mutex<Option<crate::dns::zone::Zone>>,
+    /// The keys a signed request may use, from `dns.keys`.
+    keys: Arc<crate::dns::tsig::Keys>,
 }
 
 impl FromSource {
@@ -272,7 +332,15 @@ impl FromSource {
             source,
             origin: LowerName::from(origin),
             last: std::sync::Mutex::new(None),
+            keys: Arc::new(crate::dns::tsig::Keys::none()),
         })
+    }
+
+    /// The same zone, checking signatures against `keys`.
+    #[must_use]
+    pub fn with_keys(mut self, keys: Arc<crate::dns::tsig::Keys>) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// The answer, from the source if it can be read and from the previous read if it cannot.
@@ -361,12 +429,56 @@ impl ZoneHandler for FromSource {
         request: &Request,
         lookup_options: LookupOptions,
     ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
+        // The same order as `InMemory`: the signature decides whether there is a question to answer.
+        let (verdict, signer) = self.keys.authorize(request, crate::dns::tsig::now());
+        if let Err(code) = verdict {
+            return (
+                LookupControlFlow::Continue(Err(LookupError::ResponseCode(code))),
+                signer,
+            );
+        }
         let Some(question) = request.queries.queries().first() else {
-            return (LookupControlFlow::Skip, None);
+            return (LookupControlFlow::Skip, signer);
         };
         let name = question.name().clone();
         let rtype = question.query_type();
-        (self.answer(&name, rtype, lookup_options).await, None)
+        (self.answer(&name, rtype, lookup_options).await, signer)
+    }
+
+    /// RFC 2136 `OPCODE=5`. Verifies the signature and refuses the update: the machine that turns
+    /// the message into `dnsRecord` writes is RRL-2.25.8, and a half-implemented one would answer
+    /// `NOERROR` without changing anything - the one answer a client must never get.
+    ///
+    /// The signature is checked **before** that refusal on purpose. A key that does not verify earns
+    /// `NOTAUTH` with `BADKEY`/`BADSIG`/`BADTIME`, which is a different statement from "this server
+    /// does not accept updates", and a client that got the second could stop trying to fix a key that
+    /// is actually wrong.
+    async fn update(
+        &self,
+        update: &Request,
+        now: u64,
+    ) -> (Result<bool, ResponseCode>, Option<TSigResponseContext>) {
+        let (verdict, signer) = self.keys.authorize(update, now);
+        match verdict {
+            Err(code) => (Err(code), signer),
+            Ok(()) => (Err(ResponseCode::Refused), signer),
+        }
+    }
+
+    async fn nsec3_records(
+        &self,
+        _info: hickory_server::zone_handler::Nsec3QueryInfo<'_>,
+        _lookup_options: LookupOptions,
+    ) -> LookupControlFlow<AuthLookup> {
+        // A zone with no NSEC3PARAM holds no chain to walk: `Skip` hands the question to the next
+        // handler, which is the honest answer for a zone that does not sign (RRL-2.25.10).
+        LookupControlFlow::Skip
+    }
+
+    fn nx_proof_kind(&self) -> Option<&hickory_server::dnssec::NxProofKind> {
+        // Nothing to prove absence with: the zone is not signed, and claiming a proof kind would
+        // make the catalog ask for records that do not exist.
+        None
     }
 
     async fn nsec_records(
@@ -412,8 +524,16 @@ pub async fn listen_from_directory(
         }
         Err(err) => return Err(format!("dns zone '{dns_name}': {err}")),
     }
+    // Built here rather than inside the handler: a key that does not load is a start-up error, and
+    // this is the only place in this path that can return one.
+    let keys = crate::dns::tsig::Keys::new(&forward.keys)?;
+    if !keys.is_empty() {
+        tracing::info!(keys = ?keys.names(), "dns: signed requests are checked against these keys");
+    }
+    let keys = Arc::new(keys);
     let handler = FromSource::new(Arc::new(in_directory), dns_name)
-        .ok_or_else(|| format!("dns zone '{dns_name}' is not a DNS name"))?;
+        .ok_or_else(|| format!("dns zone '{dns_name}' is not a DNS name"))?
+        .with_keys(Arc::clone(&keys));
     let handler = Arc::new(handler);
     let ours = handler.origin().clone();
     let catalog = catalog_from(Arc::clone(&handler));
@@ -421,7 +541,7 @@ pub async fn listen_from_directory(
     // the port may have been chosen by the kernel: a listener that reported a different address than
     // it took would be one nobody can find.
     let forward = crate::dns::config::Settings { bind, ..forward };
-    listen(bind, Answering::new(catalog, ours, forward)).await
+    listen(bind, Answering::new(catalog, ours, forward).with_keys(keys)).await
 }
 
 /// A catalog plus a forwarder: the zone this server holds, and everywhere else it was told to ask.
@@ -436,6 +556,13 @@ pub struct Answering {
     ours: LowerName,
     /// The servers for everything else, empty when nothing is forwarded.
     forward: crate::dns::config::Settings,
+    /// The keys a signed request may use, shared with the zone handler.
+    ///
+    /// Here as well as there because two kinds of request never reach a zone handler: one for a
+    /// name that is not ours, and one whose signature names a key it does not have. Both are still
+    /// answered, and RFC 8945 wants an answer to a signed request to say what happened to the
+    /// signature - `REFUSED` signed with the same key, or `NOTAUTH` with `BADKEY`.
+    keys: Arc<crate::dns::tsig::Keys>,
 }
 
 impl Answering {
@@ -445,7 +572,15 @@ impl Answering {
             catalog,
             ours,
             forward,
+            keys: Arc::new(crate::dns::tsig::Keys::none()),
         }
+    }
+
+    /// The same handler, checking signatures against `keys`.
+    #[must_use]
+    pub fn with_keys(mut self, keys: Arc<crate::dns::tsig::Keys>) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// Whether `name` is this server's to answer.
@@ -488,6 +623,32 @@ impl hickory_server::server::RequestHandler for Answering {
                 .handle_request::<R, T>(request, response_handle)
                 .await;
         }
+        // A signed question for a name that is not ours has two honest answers and no third: a
+        // signature that does not verify earns `NOTAUTH` with the TSIG error that says why, and one
+        // that does earns `REFUSED` - signed with the same key, because an unsigned answer to a
+        // signed question is a protocol error the client can only report as a timeout.
+        if request.signature.is_some() {
+            let (verdict, signer) = self.keys.authorize(request, crate::dns::tsig::now());
+            let code = match verdict {
+                Ok(()) => {
+                    tracing::debug!(
+                        name = %query.name(),
+                        "dns: a signed query for a name this server does not hold: refused, not forwarded"
+                    );
+                    ResponseCode::Refused
+                }
+                Err(code) => code,
+            };
+            return answer_with(
+                request,
+                response_handle,
+                code,
+                Vec::new(),
+                Vec::new(),
+                signer,
+            )
+            .await;
+        }
         if !crate::dns::forward::is_forwardable(query.query_type()) {
             return answer_with(
                 request,
@@ -495,6 +656,7 @@ impl hickory_server::server::RequestHandler for Answering {
                 ResponseCode::Refused,
                 Vec::new(),
                 Vec::new(),
+                None,
             )
             .await;
         }
@@ -512,6 +674,7 @@ impl hickory_server::server::RequestHandler for Answering {
                 ResponseCode::Refused,
                 Vec::new(),
                 Vec::new(),
+                None,
             )
             .await;
         };
@@ -528,7 +691,7 @@ impl hickory_server::server::RequestHandler for Answering {
                 let code = answer.metadata.response_code;
                 let answers: Vec<Record> = answer.answers;
                 let authorities: Vec<Record> = answer.authorities;
-                answer_with(request, response_handle, code, answers, authorities).await
+                answer_with(request, response_handle, code, answers, authorities, None).await
             }
             None => {
                 // Configured and did not work: `SERVFAIL` is the code for exactly that.
@@ -543,6 +706,7 @@ impl hickory_server::server::RequestHandler for Answering {
                     ResponseCode::ServFail,
                     Vec::new(),
                     Vec::new(),
+                    None,
                 )
                 .await
             }
@@ -557,7 +721,9 @@ async fn answer_with<R: hickory_server::server::ResponseHandler>(
     code: ResponseCode,
     answers: Vec<Record>,
     authorities: Vec<Record>,
+    signer: Option<TSigResponseContext>,
 ) -> hickory_server::server::ResponseInfo {
+    use hickory_server::proto::serialize::binary::BinEncoder;
     use hickory_server::zone_handler::MessageResponseBuilder;
 
     let mut metadata =
@@ -567,13 +733,52 @@ async fn answer_with<R: hickory_server::server::ResponseHandler>(
     // The recursion flag describes this server's own behaviour: it forwarded, so it was available.
     metadata.recursion_available = !answers.is_empty() || code == ResponseCode::NXDomain;
 
-    let response = MessageResponseBuilder::new(&request.queries, request.edns.as_ref()).build(
+    // Two builds when a signature is asked for, and that is not a style choice: the MAC covers the
+    // message as it travels, `destructive_emit` consumes the response to produce those octets, and a
+    // signature added afterwards would have to be covered by a second encoding - which is a
+    // different byte stream the moment name compression picks another pointer. So the octets are
+    // produced from one copy, signed, and the signature is set on the copy that is sent.
+    let signature = match signer {
+        None => None,
+        Some(signer) => {
+            let tbs_response = MessageResponseBuilder::new(&request.queries, request.edns.as_ref())
+                .build(
+                    metadata,
+                    answers.iter(),
+                    authorities.iter(),
+                    std::iter::empty(),
+                    std::iter::empty(),
+                );
+            let mut tbs = Vec::with_capacity(256);
+            let mut encoder = BinEncoder::new(&mut tbs);
+            let mut signature = None;
+            match tbs_response.destructive_emit(&mut encoder) {
+                Ok(_counts) => match signer.sign(&tbs) {
+                    Ok(record) => signature = Some(record),
+                    // Reported, not retried with a different code: an HMAC failure here means this
+                    // machine cannot produce the answer at all. The client rejects an unsigned answer
+                    // to a signed question, which is the right outcome and needs no second path.
+                    Err(err) => tracing::error!(%err, "dns: the answer could not be signed"),
+                },
+                Err(err) => {
+                    tracing::error!(%err, "dns: the answer could not be encoded for signing")
+                }
+            }
+            signature
+        }
+    };
+
+    let mut response = MessageResponseBuilder::new(&request.queries, request.edns.as_ref()).build(
         metadata,
         answers.iter(),
         authorities.iter(),
         std::iter::empty(),
         std::iter::empty(),
     );
+    if let Some(signature) = signature {
+        response.set_signature(signature);
+    }
+
     match response_handle.send_response(response).await {
         Ok(info) => info,
         Err(err) => {

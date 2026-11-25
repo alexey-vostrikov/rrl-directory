@@ -43,6 +43,45 @@ pub struct DnsConfig {
     /// `/dns` by default: a directory of zone files, one per zone, so an operator can read the
     /// records without a directory client and a rebuild does not silently invent a different zone.
     pub zones_dir: Option<PathBuf>,
+    /// The keys a signed request may use, TSIG (RFC 8945).
+    ///
+    /// Empty means no request can be signed and every signature is refused as `BADKEY` - which is
+    /// the honest answer for a server that holds no keys, and not a quiet acceptance.
+    pub keys: Vec<TsigKeyConfig>,
+}
+
+/// One `dns.keys` entry as it is written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TsigKeyConfig {
+    /// The key name, as `nsupdate -y <algorithm>:<name>:<secret>` spells it.
+    pub name: String,
+    /// The shared secret, base64 - the form `dnssec-keygen` and every BIND guide print.
+    pub secret: String,
+    /// `hmac-sha256` unless said otherwise. The algorithm is part of the key's identity in RFC 8945,
+    /// and a client that signs with another one is refused rather than guessed at.
+    #[serde(default = "default_algorithm")]
+    pub algorithm: String,
+    /// How far the client's clock may differ, in seconds. RFC 8945 §10 recommends 300.
+    #[serde(default = "default_fudge")]
+    pub fudge: u16,
+}
+
+fn default_algorithm() -> String {
+    "hmac-sha256".to_string()
+}
+
+fn default_fudge() -> u16 {
+    300
+}
+
+/// A key that resolved: its name parsed, its secret decoded, its algorithm known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsigKey {
+    pub name: hickory_server::proto::rr::Name,
+    pub secret: Vec<u8>,
+    pub algorithm: hickory_server::proto::rr::rdata::tsig::TsigAlgorithm,
+    pub fudge: u16,
 }
 
 /// Conditional forwarding, in the shape AD calls it: different suffixes to different servers.
@@ -74,6 +113,8 @@ pub struct Settings {
     pub forward_zones: BTreeMap<String, Vec<SocketAddr>>,
     /// Where the zone is written.
     pub zones_dir: PathBuf,
+    /// The keys a signed request may use, resolved.
+    pub keys: Vec<TsigKey>,
 }
 
 impl Settings {
@@ -160,6 +201,7 @@ impl Settings {
                 .zones_dir
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("/dns")),
+            keys: resolve_keys(&config.keys)?,
         })
     }
 
@@ -201,6 +243,69 @@ fn is_under(name: &str, suffix: &str) -> bool {
         Some(head) => head.ends_with('.'),
         None => false,
     }
+}
+
+/// The `dns.keys` section, resolved: names parsed, secrets decoded, algorithms accepted.
+///
+/// Every refusal is a start-up error, deliberately. A key that does not load is a client told
+/// `BADKEY` hours later, and by then the person who wrote the file is not the one reading the log.
+/// A duplicate name is refused for the reason RFC 8945 §5.5 gives: one name, one algorithm - two
+/// entries under one name would make which key verified depend on the order of the list.
+fn resolve_keys(keys: &[TsigKeyConfig]) -> Result<Vec<TsigKey>, String> {
+    use hickory_server::proto::rr::Name;
+    use hickory_server::proto::rr::rdata::tsig::TsigAlgorithm;
+
+    let mut resolved: Vec<TsigKey> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let name = Name::from_ascii(key.name.trim().trim_end_matches('.'))
+            .map(|mut name| {
+                name.set_fqdn(true);
+                name
+            })
+            .map_err(|err| format!("dns.keys '{}' is not a DNS name: {err}", key.name))?;
+
+        // The three the crate implements for cryptographic operations. The rest - `hmac-md5`,
+        // `hmac-sha1`, `gss-tsig` and the truncated variants - are named rather than accepted and
+        // refused later: a key that parses but can never verify is a configuration that lies.
+        let algorithm = match key.algorithm.trim().to_ascii_lowercase().as_str() {
+            "hmac-sha256" => TsigAlgorithm::HmacSha256,
+            "hmac-sha384" => TsigAlgorithm::HmacSha384,
+            "hmac-sha512" => TsigAlgorithm::HmacSha512,
+            other => {
+                return Err(format!(
+                    "dns.keys '{}' names algorithm '{other}', which this server cannot verify: \
+                     use hmac-sha256, hmac-sha384 or hmac-sha512",
+                    key.name
+                ));
+            }
+        };
+
+        let secret = crate::model::decode_binary(&key.secret).ok_or_else(|| {
+            format!(
+                "dns.keys '{}' has a secret that is not base64: the shared key is written the way \
+                 `dnssec-keygen` prints it",
+                key.name
+            )
+        })?;
+        if secret.is_empty() {
+            return Err(format!("dns.keys '{}' has an empty secret", key.name));
+        }
+
+        if resolved.iter().any(|existing| existing.name == name) {
+            return Err(format!(
+                "dns.keys names '{}' twice: one name, one key",
+                key.name
+            ));
+        }
+
+        resolved.push(TsigKey {
+            name,
+            secret,
+            algorithm,
+            fudge: key.fudge,
+        });
+    }
+    Ok(resolved)
 }
 
 /// Whether `text` is a domain name: labels of 1 to 63 octets separated by dots.

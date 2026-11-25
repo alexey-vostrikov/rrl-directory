@@ -73,6 +73,22 @@ pub struct DnssecConfig {
     pub keys: Vec<KeyConfig>,
     /// How long a signature is valid, in days. Thirty unless said otherwise.
     pub signature_days: Option<u32>,
+    /// Publish `NSEC3` denials, so a validator accepts `NXDOMAIN` as well as the positive answers.
+    ///
+    /// Off by default, and that is honest rather than lazy: a zone whose denials are unproven is one
+    /// where every positive answer validates and every miss is `SERVFAIL` - a state a server should
+    /// enter deliberately. `Some` with an empty salt is what RFC 9276 recommends for a new zone.
+    pub nsec3: Option<Nsec3Config>,
+}
+
+/// The knobs of a zone's `NSEC3` chain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Nsec3Config {
+    /// The salt, base64. Absent means empty, which several registries publish.
+    pub salt: Option<String>,
+    /// Extra hash iterations. Zero unless said otherwise - RFC 9276 §3.1.
+    pub iterations: Option<u16>,
 }
 
 /// A key that loaded: what signs, and what the zone has to publish for a validator to find it.
@@ -186,6 +202,8 @@ impl Key {
 pub struct Signers {
     keys: Vec<Key>,
     origin: Option<Name>,
+    /// The `NSEC3` parameters, when the zone publishes denials. `None` means positive answers only.
+    nsec3: Option<crate::dns::nsec3::Params>,
 }
 
 impl Signers {
@@ -216,6 +234,25 @@ impl Signers {
         let mut apex = apex;
         apex.set_fqdn(true);
 
+        let nsec3 = match &config.nsec3 {
+            None => None,
+            Some(nsec3) => {
+                let salt = match nsec3.salt.as_deref() {
+                    None => Vec::new(),
+                    Some(text) => crate::model::decode_binary(text).ok_or_else(|| {
+                        format!(
+                            "dns.dnssec.nsec3.salt is '{text}', which is not base64: a salt is \
+                             octets, written the way every DNSSEC tool prints them"
+                        )
+                    })?,
+                };
+                Some(crate::dns::nsec3::Params {
+                    salt,
+                    iterations: nsec3.iterations.unwrap_or(0),
+                })
+            }
+        };
+
         let mut keys = Vec::with_capacity(config.keys.len());
         for key in &config.keys {
             keys.push(Key::load(key, &apex, validity)?);
@@ -226,6 +263,7 @@ impl Signers {
         Ok(Self {
             keys,
             origin: Some(apex),
+            nsec3,
         })
     }
 
@@ -257,6 +295,16 @@ impl Signers {
         // everything else. A zone that left its own key unsigned is a zone nothing can trust.
         for key in &self.keys {
             signed.push(key.dnskey_record(origin));
+        }
+
+        // Then the denial chain, built from the records as they stand - an update changes the set of
+        // hashes, so a chain computed anywhere but here would be one update behind.
+        if let Some(params) = &self.nsec3 {
+            signed.push(crate::dns::nsec3::param_record(origin, params, KEY_TTL));
+            // `signed: true` - the records about to be signed, so every bitmap names `RRSIG`.
+            let chain = crate::dns::nsec3::chain(origin, &signed, params, KEY_TTL, true)
+                .map_err(|err| format!("the NSEC3 chain could not be built: {err}"))?;
+            signed.extend(chain);
         }
 
         // Seconds past the wire form's range would be a date in 2106; a clock that far out is a
@@ -299,6 +347,80 @@ impl Signers {
 
         signed.extend(rrsigs);
         Ok(signed)
+    }
+}
+
+impl Signers {
+    /// The `NSEC3`s that deny `qname`, or `None` when the zone publishes no denials.
+    ///
+    /// `signed` is the zone as `sign` returned it, so the type bitmaps carry `RRSIG` - a bitmap that
+    /// does not name a type the owner has is a denial a validator rejects.
+    pub fn denial(
+        &self,
+        signed: &[Record],
+        qname: &Name,
+        qtype: RecordType,
+    ) -> Option<Vec<Record>> {
+        let params = self.nsec3.as_ref()?;
+        let origin = self.origin.as_ref()?;
+        // The chain that is already in the zone, not a copy rebuilt here: those are the records that
+        // were signed, so the `RRSIG`s beside them belong to exactly these RRsets. Rebuilding the
+        // chain produced records that differed from the signed ones in a way the signature noticed.
+        let chain: Vec<Record> = signed
+            .iter()
+            .filter(|record| record.record_type() == RecordType::NSEC3)
+            .cloned()
+            .collect();
+        let _ = origin;
+        let proof = match crate::dns::nsec3::denial(origin, &chain, qname, qtype, params) {
+            Ok(proof) => proof?,
+            Err(err) => {
+                tracing::error!(%err, "dns: a denial could not be built");
+                return None;
+            }
+        };
+
+        // Every `NSEC3` in the proof travels with its `RRSIG`: an unsigned denial is one a
+        // validator rejects, and the signature is what makes the answer `NXDOMAIN validated`
+        // rather than `SERVFAIL`. Matched by owner and by the type the signature covers.
+        let mut with_signatures = Vec::with_capacity(proof.len() * 2);
+        for record in proof {
+            let owner = record.name.to_ascii();
+            let signature = signed.iter().find(|candidate| {
+                candidate.name.to_ascii() == owner
+                    && matches!(
+                        &candidate.data,
+                        RData::DNSSEC(DNSSECRData::RRSIG(sig))
+                            if sig.input().type_covered == RecordType::NSEC3
+                    )
+            });
+            with_signatures.push(record);
+            if let Some(signature) = signature {
+                with_signatures.push(signature.clone());
+            }
+        }
+        Some(with_signatures)
+    }
+
+    /// Whether this zone publishes `NSEC3` denials.
+    pub fn has_denials(&self) -> bool {
+        self.nsec3.is_some()
+    }
+
+    /// The salt the chain is hashed with, empty when there is none.
+    pub fn nsec3_salt(&self) -> Vec<u8> {
+        self.nsec3
+            .as_ref()
+            .map(|params| params.salt.clone())
+            .unwrap_or_default()
+    }
+
+    /// How many extra iterations the chain uses.
+    pub fn nsec3_iterations(&self) -> u16 {
+        self.nsec3
+            .as_ref()
+            .map(|params| params.iterations)
+            .unwrap_or(0)
     }
 }
 

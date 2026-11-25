@@ -135,6 +135,9 @@ tracing = "0.1.44"
 # Only for `dns`: the inception and expiration of an `RRSIG` are calendar times, and `hickory` takes
 # them as `time::OffsetDateTime`.
 time = { version = "0.3.55", optional = true }
+# The `NSEC3` owner label is base32hex without padding, which is `BASE32_DNSSEC` here - the same
+# alphabet every other DNSSEC tool uses, and not base32 with a different table written by hand.
+data-encoding = { version = "2.6", optional = true }
 # `env-filter` for `RUST_LOG`: the reason to reach for it is always one module that misbehaves,
 # and `RUST_LOG=smb_server::rpc=debug` says that without raising the whole process. `time` for
 # `log_timestamp` in RFC 3339.
@@ -148,7 +151,7 @@ smb = ["dep:smb-server"]
 # Port 53 and the zone a domain lives in: the `dnsRecord` values under `CN=RRLDNS`.
 # `dep:time` for the inception and expiration of a DNSSEC signature: they travel as seconds, and
 # converting between that and a calendar date by hand is how a leap second becomes a rejected zone.
-dns = ["dep:hickory-server", "dep:time"]
+dns = ["dep:hickory-server", "dep:time", "dep:data-encoding"]
 # The directory in an S3 bucket, `backends.<name>.type = "slate-s3"`: several servers on one store,
 # and a host that can be replaced without a copy of the data. Off by default: an object store puts
 # a 50 ms window in front of every durable write, which a directory on one host has no reason to take.

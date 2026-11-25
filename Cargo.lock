@@ -3411,6 +3411,7 @@ dependencies = [
  "bcrypt",
  "caseless",
  "clap",
+ "data-encoding",
  "futures",
  "getrandom 0.4.3",
  "hickory-server",

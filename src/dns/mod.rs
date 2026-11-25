@@ -24,6 +24,7 @@ pub mod config;
 pub mod dnssec;
 pub mod forward;
 pub mod keys;
+pub mod nsec3;
 pub mod property;
 pub mod provision;
 pub mod record;

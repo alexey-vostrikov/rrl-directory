@@ -477,6 +477,12 @@ pub struct FromSource {
     /// What the last successful read returned, for the case where the next one fails. The records
     /// rather than the zone: the signed set is what an answer is built from.
     last: std::sync::Mutex<Option<Vec<Record>>>,
+    /// How this zone proves absence, or `None` when it publishes no denials. `hickory` reads this to
+    /// decide whether to ask for `NSEC3`s at all, so it is a fact about the zone rather than a
+    /// decision taken per query.
+    proof: Option<hickory_server::dnssec::NxProofKind>,
+    /// The keys and the chain parameters, so a denial can be built without asking the source twice.
+    signers: std::sync::Arc<crate::dns::dnssec::Signers>,
 }
 
 impl FromSource {
@@ -496,7 +502,24 @@ impl FromSource {
             source,
             origin: LowerName::from(origin),
             last: std::sync::Mutex::new(None),
+            proof: None,
+            signers: std::sync::Arc::new(crate::dns::dnssec::Signers::none()),
         })
+    }
+
+    /// The same handler, signing and proving with `signers`.
+    #[must_use]
+    pub fn with_signers(mut self, signers: std::sync::Arc<crate::dns::dnssec::Signers>) -> Self {
+        if signers.has_denials() {
+            self.proof = Some(hickory_server::dnssec::NxProofKind::Nsec3 {
+                algorithm: hickory_server::proto::dnssec::Nsec3HashAlgorithm::SHA1,
+                salt: signers.nsec3_salt().into(),
+                iterations: signers.nsec3_iterations(),
+                opt_out: false,
+            });
+        }
+        self.signers = signers;
+        self
     }
 
     /// The answer, from the source if it can be read and from the previous read if it cannot.
@@ -639,18 +662,35 @@ impl ZoneHandler for FromSource {
 
     async fn nsec3_records(
         &self,
-        _info: hickory_server::zone_handler::Nsec3QueryInfo<'_>,
-        _lookup_options: LookupOptions,
+        info: hickory_server::zone_handler::Nsec3QueryInfo<'_>,
+        lookup_options: LookupOptions,
     ) -> LookupControlFlow<AuthLookup> {
-        // A zone with no NSEC3PARAM holds no chain to walk: `Skip` hands the question to the next
-        // handler, which is the honest answer for a zone that does not sign (RRL-2.25.10).
-        LookupControlFlow::Skip
+        // The chain is built from the zone as it stands now, which is the only chain that proves
+        // anything: an update changes the set of hashes, and a chain one update behind makes a
+        // validator reject the whole zone rather than one answer.
+        let Ok(signed) = self.source.signed().await else {
+            return LookupControlFlow::Continue(Err(LookupError::ResponseCode(
+                ResponseCode::ServFail,
+            )));
+        };
+        let qname = hickory_server::proto::rr::Name::from(info.qname.clone());
+        let Some(proof) = self.signers.denial(&signed, &qname, info.qtype) else {
+            // No chain, or no proof for this name: `Skip` rather than a partial answer, because a
+            // denial with one record missing is one every validator rejects.
+            return LookupControlFlow::Skip;
+        };
+
+        let sets = crate::dns::nsec3::answer_sets(proof);
+        LookupControlFlow::Continue(Ok(AuthLookup::Records {
+            answers: LookupRecords::many(lookup_options, sets),
+            additionals: None,
+        }))
     }
 
     fn nx_proof_kind(&self) -> Option<&hickory_server::dnssec::NxProofKind> {
-        // Nothing to prove absence with: the zone is not signed, and claiming a proof kind would
-        // make the catalog ask for records that do not exist.
-        None
+        // `Some` only when the zone really publishes a chain: telling the catalog to ask for
+        // `NSEC3`s a zone does not have is how an answer comes back with no proof in it.
+        self.proof.as_ref()
     }
 
     async fn nsec_records(
@@ -658,7 +698,7 @@ impl ZoneHandler for FromSource {
         _name: &LowerName,
         _lookup_options: LookupOptions,
     ) -> LookupControlFlow<AuthLookup> {
-        // Unsigned, as `InMemory` is: no proof of absence exists to hand out.
+        // `NSEC` walking is what `NSEC3` exists to avoid; this zone publishes no unhashed chain.
         LookupControlFlow::Skip
     }
 }
@@ -721,7 +761,8 @@ pub async fn listen_from_directory(
         tracing::info!(keys = ?keys.names(), "dns: signed requests are checked against these keys");
     }
     let handler = FromSource::new(Arc::new(in_directory), dns_name)
-        .ok_or_else(|| format!("dns zone '{dns_name}' is not a DNS name"))?;
+        .ok_or_else(|| format!("dns zone '{dns_name}' is not a DNS name"))?
+        .with_signers(Arc::clone(&signers));
     let handler = Arc::new(handler);
     let ours = handler.origin().clone();
     let catalog = catalog_from(Arc::clone(&handler));

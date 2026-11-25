@@ -69,6 +69,9 @@ fn signers() -> Signers {
                 file: key_path(),
             }],
             signature_days: None,
+            // Positive answers only: the denials have their own test, and a chain here would make
+            // every other assertion about coverage noisier for no gain.
+            nsec3: None,
         },
         DOMAIN,
     )
@@ -398,6 +401,85 @@ fn a_signature_does_not_verify_if_the_tag_the_labels_or_the_expiration_is_change
     );
 }
 
+/// With `NSEC3` on, the denial chain is signed too, and its signatures verify.
+///
+/// The chain is built twice - once before signing and once when a denial is assembled - and a bitmap
+/// that differed between the two made the second chain a different RRset from the one that had been
+/// signed, so every `RRSIG` over `NSEC3` failed to verify while every other signature passed. That is
+/// the failure this test exists to catch, and it is why the TTL/type rules are asserted on the
+/// records that a denial would actually carry.
+#[test]
+fn the_nsec3_chain_is_signed_and_its_signatures_verify() {
+    let signers = Signers::new(
+        &DnssecConfig {
+            keys: vec![KeyConfig {
+                algorithm: "ecdsa-p256-sha256".to_string(),
+                file: key_path(),
+            }],
+            signature_days: None,
+            nsec3: Some(rrl_directory::dns::dnssec::Nsec3Config {
+                salt: Some("aGVsbG8=".to_string()),
+                iterations: Some(0),
+            }),
+        },
+        DOMAIN,
+    )
+    .expect("the key loads");
+
+    let signed = signers.sign(&records(), now()).expect("the zone signs");
+    assert!(
+        signed
+            .iter()
+            .any(|record| record.record_type() == RecordType::NSEC3PARAM),
+        "the zone publishes its hash parameters"
+    );
+
+    let dnskey = signed
+        .iter()
+        .find_map(|record| match &record.data {
+            RData::DNSSEC(DNSSECRData::DNSKEY(key)) => Some(key.clone()),
+            _ => None,
+        })
+        .expect("a DNSKEY");
+
+    let chain: Vec<&Record> = signed
+        .iter()
+        .filter(|record| record.record_type() == RecordType::NSEC3)
+        .collect();
+    // Three names in this zone: the apex (with its `DNSKEY`), `dc1` and `host`. One link each.
+    assert_eq!(chain.len(), 3, "one link per name: {}", chain.len());
+
+    for link in &chain {
+        let owner = link.name.to_ascii();
+        assert!(
+            owner.to_ascii_uppercase().starts_with(
+                &owner
+                    .split('.')
+                    .next()
+                    .expect("a label")
+                    .to_ascii_uppercase()
+            ),
+            "the owner is its hash label"
+        );
+        let rrsig = signed
+            .iter()
+            .find_map(|candidate| match &candidate.data {
+                RData::DNSSEC(DNSSECRData::RRSIG(sig))
+                    if candidate.name.to_ascii() == owner
+                        && sig.input().type_covered == RecordType::NSEC3 =>
+                {
+                    Some(sig.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{owner} NSEC3 is unsigned"));
+
+        dnskey
+            .verify_rrsig(&link.name, DNSClass::IN, &rrsig, std::iter::once(*link))
+            .unwrap_or_else(|err| panic!("the NSEC3 signature at {owner} must verify: {err}"));
+    }
+}
+
 /// Two keys sign, and both signatures verify: that is what a rollover looks like from outside.
 #[test]
 fn two_keys_both_sign_during_a_rollover() {
@@ -413,6 +495,7 @@ fn two_keys_both_sign_during_a_rollover() {
             },
         ],
         signature_days: Some(7),
+        nsec3: None,
     };
     // The same file twice: two signers over one key, which is the shape a rollover has (two keys)
     // without needing a second fixture. The tags collide and that is visible below.

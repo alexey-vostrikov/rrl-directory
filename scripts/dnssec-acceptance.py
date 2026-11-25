@@ -139,6 +139,23 @@ def main():
         print("  FAILURE: the corrupted signature was accepted")
         return 2
 
+    # Compatibility: a client that does not ask for DNSSEC gets the answer without the records it
+    # does not understand - and gets it, rather than a SERVFAIL that a resolver turns into "this name
+    # does not exist". RFC 4035 §3.2.1: signatures ride on the DO bit, not on the zone being signed.
+    plain = dns.query.udp(
+        dns.message.make_query(f"dc1.{zone_text}", "A", use_edns=0), server, port=port, timeout=5
+    )
+    assert plain.rcode() == dns.rcode.NOERROR, (
+        f"a client without DO got {dns.rcode.to_text(plain.rcode())} instead of the answer"
+    )
+    assert not [rr for rr in plain.answer if rr.rdtype == dns.rdatatype.RRSIG], (
+        "an RRSIG was sent to a client that did not ask for one"
+    )
+    assert [rr for rr in plain.answer if rr.rdtype == dns.rdatatype.A], (
+        "the answer itself is missing for a client without DO"
+    )
+    print("  without DO: the answer arrives, without RRSIG")
+
     # A negative answer: an NXDOMAIN has to prove itself with NSEC3 signed by this zone.
     missing = fetch(server, port, f"nosuch.{zone_text}", "A")
     assert missing.rcode() == dns.rcode.NXDOMAIN, (

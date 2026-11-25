@@ -54,6 +54,8 @@ fn settings() -> Settings {
         forward_default: Vec::new(),
         forward_zones: std::collections::BTreeMap::new(),
         zones_dir: std::path::PathBuf::from("/dns"),
+        // No signing key: these suites are about TSIG and the forwarder.
+        dnssec: Default::default(),
         keys: vec![TsigKey {
             name: Name::from_ascii(KEY).expect("a key name"),
             secret: SECRET.to_vec(),

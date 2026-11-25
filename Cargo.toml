@@ -132,6 +132,9 @@ smb-server = { git = "https://github.com/alexey-vostrikov/rrl-smb", branch = "ma
 # reads what the configuration and the command line already offered: `-d`, `log_timestamp`,
 # `log_caller`, `--log`.
 tracing = "0.1.44"
+# Only for `dns`: the inception and expiration of an `RRSIG` are calendar times, and `hickory` takes
+# them as `time::OffsetDateTime`.
+time = { version = "0.3.55", optional = true }
 # `env-filter` for `RUST_LOG`: the reason to reach for it is always one module that misbehaves,
 # and `RUST_LOG=smb_server::rpc=debug` says that without raising the whole process. `time` for
 # `log_timestamp` in RFC 3339.
@@ -143,7 +146,9 @@ kdc = ["dep:rrl-kdc"]
 # Port 445 and the `IPC$` share a join talks to.
 smb = ["dep:smb-server"]
 # Port 53 and the zone a domain lives in: the `dnsRecord` values under `CN=RRLDNS`.
-dns = ["dep:hickory-server"]
+# `dep:time` for the inception and expiration of a DNSSEC signature: they travel as seconds, and
+# converting between that and a calendar date by hand is how a leap second becomes a rejected zone.
+dns = ["dep:hickory-server", "dep:time"]
 # The directory in an S3 bucket, `backends.<name>.type = "slate-s3"`: several servers on one store,
 # and a host that can be replaced without a copy of the data. Off by default: an object store puts
 # a 50 ms window in front of every durable write, which a directory on one host has no reason to take.
@@ -159,7 +164,9 @@ tower = { version = "0.5.3", features = ["util"] }
 # The DNS tests speak the protocol themselves: a fake upstream and the client side of the exchange
 # are written with the same crate the server is, because the point of `tests/dns_forward.rs` is the
 # wire, and a mock of the wire would test the mock.
-hickory-server = { version = "0.26.3", default-features = false }
+# `dnssec-ring` because `tests/dns_dnssec.rs` verifies the signatures this server makes, with the
+# same code a validator uses - a signature nobody checks is a signature nobody knows is wrong.
+hickory-server = { version = "0.26.3", default-features = false, features = ["dnssec-ring"] }
 
 # A local copy of rasn-ldap with the RFC 4511 result codes upstream is missing
 # (118-123, including assertionFailed). The patch is the enum variants only; it is

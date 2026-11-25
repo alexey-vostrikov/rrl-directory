@@ -21,6 +21,7 @@
 //! with.
 
 pub mod config;
+pub mod dnssec;
 pub mod forward;
 pub mod keys;
 pub mod property;

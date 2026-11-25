@@ -344,9 +344,8 @@ pub fn plan(
     // a zone without one - and the `SOA` is what carries the serial every client and secondary looks
     // at. An update that removes it is refused rather than applied and then unreadable.
     let apex_now = touched.get(APEX);
-    let apex_keeps_soa = apex_now.map_or(true, |node| {
-        node.records.iter().any(|record| record.rtype == kind::SOA)
-    });
+    let apex_keeps_soa =
+        apex_now.is_none_or(|node| node.records.iter().any(|record| record.rtype == kind::SOA));
     if !apex_keeps_soa {
         return Err(ResponseCode::Refused);
     }

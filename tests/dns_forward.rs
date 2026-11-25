@@ -129,6 +129,7 @@ fn settings(
         // No keys: this suite is about the forwarder, and a signed request it never sends cannot
         // be verified by anything.
         keys: Vec::new(),
+        dnssec: Default::default(),
     }
 }
 

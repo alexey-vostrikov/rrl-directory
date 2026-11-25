@@ -43,6 +43,11 @@ pub struct DnsConfig {
     /// `/dns` by default: a directory of zone files, one per zone, so an operator can read the
     /// records without a directory client and a rebuild does not silently invent a different zone.
     pub zones_dir: Option<PathBuf>,
+    /// The keys that sign the zone, DNSSEC.
+    ///
+    /// Empty means the zone is served unsigned - which is what every zone was until this section
+    /// existed, and what a server that is not a validator's trust anchor should stay.
+    pub dnssec: crate::dns::dnssec::DnssecConfig,
     /// The keys a signed request may use, TSIG (RFC 8945).
     ///
     /// Empty means no request can be signed and every signature is refused as `BADKEY` - which is
@@ -115,6 +120,10 @@ pub struct Settings {
     pub zones_dir: PathBuf,
     /// The keys a signed request may use, resolved.
     pub keys: Vec<TsigKey>,
+    /// The `dns.dnssec` section as written. The keys are loaded by the listener, where a failure is
+    /// a start-up error with a port not yet taken, and where `Signers` can hold the key material
+    /// without this type having to be `Clone`.
+    pub dnssec: crate::dns::dnssec::DnssecConfig,
 }
 
 impl Settings {
@@ -202,6 +211,7 @@ impl Settings {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("/dns")),
             keys: resolve_keys(&config.keys)?,
+            dnssec: config.dnssec.clone(),
         })
     }
 

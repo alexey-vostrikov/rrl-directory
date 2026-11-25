@@ -21,8 +21,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hickory_server::proto::dnssec::rdata::DNSSECRData;
 use hickory_server::proto::op::ResponseCode;
-use hickory_server::proto::rr::{LowerName, Record, RecordSet, RecordType, TSigResponseContext};
+use hickory_server::proto::rr::{
+    LowerName, RData, Record, RecordSet, RecordType, TSigResponseContext,
+};
 use hickory_server::server::{Request, RequestInfo, Server};
 use hickory_server::zone_handler::{
     AuthLookup, AxfrPolicy, Catalog, LookupControlFlow, LookupError, LookupOptions, LookupRecords,
@@ -143,6 +146,27 @@ fn answer_over(
                 set.insert(record, 0);
                 sets.push(Arc::new(set));
             }
+        }
+    }
+
+    // The signatures travel inside their RRset, not beside it: `LookupOptions::rrset_with_rrigs`
+    // decides whether they are emitted, which is the `DO` bit of the request. Attaching them here -
+    // and only here - is what makes a `dig +dnssec` answer verifiable while an ordinary query stays
+    // the size it was.
+    //
+    // A signature is matched to its set by the type it covers, because that is what an `RRSIG` says
+    // about itself; matching by position would assume the records arrive in the order they were
+    // signed.
+    for record in records {
+        let RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) = &record.data else {
+            continue;
+        };
+        if LowerName::from(record.name.clone()) != *name {
+            continue;
+        }
+        let covered = rrsig.input().type_covered;
+        if let Some(set) = sets.iter_mut().find(|set| set.record_type() == covered) {
+            Arc::make_mut(set).insert_rrsig(record.clone());
         }
     }
     LookupControlFlow::Continue(Ok(AuthLookup::Records {
@@ -276,6 +300,15 @@ pub trait ZoneSource: Send + Sync {
         Arc::new(crate::dns::tsig::Keys::none())
     }
 
+    /// The zone as it stands, signed - or unsigned when no key is configured.
+    ///
+    /// The default reads the zone and returns it as it is, which is what a source that holds no key
+    /// material can honestly do. A source that has keys overrides this and signs at read time, which
+    /// is what keeps a signature consistent with an RFC 2136 update applied a moment ago.
+    async fn signed(&self) -> Result<Vec<Record>, crate::dns::zone::Error> {
+        Ok(self.read().await?.records)
+    }
+
     /// Applies one RFC 2136 update message, or says why not.
     ///
     /// Default: refused. A source with no directory to write to cannot register anything, and
@@ -299,6 +332,9 @@ pub struct InDirectory {
     dns_name: String,
     /// The keys `dns.keys` names, beside the ones the directory holds.
     configured: Vec<crate::dns::config::TsigKey>,
+    /// The keys that sign the zone, or none: a zone served unsigned is what every zone was until
+    /// `dns.dnssec` existed.
+    signers: std::sync::Arc<crate::dns::dnssec::Signers>,
 }
 
 impl InDirectory {
@@ -309,7 +345,15 @@ impl InDirectory {
             base_dn: base_dn.to_string(),
             dns_name: dns_name.trim_end_matches('.').to_string(),
             configured: Vec::new(),
+            signers: std::sync::Arc::new(crate::dns::dnssec::Signers::none()),
         }
+    }
+
+    /// The same source, signing every answer with `signers`.
+    #[must_use]
+    pub fn with_signers(mut self, signers: std::sync::Arc<crate::dns::dnssec::Signers>) -> Self {
+        self.signers = signers;
+        self
     }
 
     /// The same source, also accepting the keys `dns.keys` names.
@@ -328,6 +372,33 @@ impl ZoneSource for InDirectory {
     async fn read(&self) -> Result<crate::dns::zone::Zone, crate::dns::zone::Error> {
         let directory = self.source.directory().await;
         crate::dns::zone::Zone::read(&directory, &self.base_dn, &self.dns_name)
+    }
+
+    /// The zone with its `RRSIG`s, made now.
+    ///
+    /// Signing here rather than at start is what keeps a signature honest across an RFC 2136 update:
+    /// the zone is read per query, so the signature covers the zone as it is at the moment of the
+    /// answer. A failure to sign is logged and the zone is answered **unsigned** - a validator then
+    /// reports unproven data, which is true, instead of the server refusing to answer at all.
+    async fn signed(&self) -> Result<Vec<Record>, crate::dns::zone::Error> {
+        let zone = self.read().await?;
+        if !zone.unserved.is_empty() {
+            tracing::debug!(
+                types = ?zone.unserved,
+                "dns: the zone holds records this build cannot render"
+            );
+        }
+        if self.signers.is_empty() {
+            return Ok(zone.records);
+        }
+        let now = crate::dns::tsig::now();
+        match self.signers.sign(&zone.records, now) {
+            Ok(signed) => Ok(signed),
+            Err(err) => {
+                tracing::error!(%err, "dns: the zone could not be signed; answering it unsigned");
+                Ok(zone.records)
+            }
+        }
     }
 
     /// Read on every check, so an issued key works and a deleted one stops working without a
@@ -403,8 +474,9 @@ impl ZoneSource for InDirectory {
 pub struct FromSource {
     source: Arc<dyn ZoneSource>,
     origin: LowerName,
-    /// What the last successful read returned, for the case above.
-    last: std::sync::Mutex<Option<crate::dns::zone::Zone>>,
+    /// What the last successful read returned, for the case where the next one fails. The records
+    /// rather than the zone: the signed set is what an answer is built from.
+    last: std::sync::Mutex<Option<Vec<Record>>>,
 }
 
 impl FromSource {
@@ -442,36 +514,26 @@ impl FromSource {
         rtype: RecordType,
         options: LookupOptions,
     ) -> LookupControlFlow<AuthLookup> {
-        match self.source.read().await {
-            Ok(zone) => {
-                if !zone.unserved.is_empty() {
-                    // Said on every query rather than once: the types are few, the line is short,
-                    // and a listener that quietly answers with records missing from the zone is the
-                    // failure this whole module is written to avoid.
-                    tracing::debug!(
-                        types = ?zone.unserved,
-                        "dns: the zone holds records this build cannot render"
-                    );
-                }
+        // `signed` and not `read`: the records come back with their `RRSIG`s, made at this moment
+        // against the zone as it stands. That is what keeps a signature consistent with an update
+        // applied a second ago - and an unsigned zone is what a source without keys returns.
+        match self.source.signed().await {
+            Ok(records) => {
                 if let Ok(mut held) = self.last.lock() {
-                    *held = Some(zone.clone());
+                    *held = Some(records.clone());
                 }
-                answer_over(&zone.records, name, rtype, options)
+                answer_over(&records, name, rtype, options)
             }
             Err(err) => {
                 tracing::warn!(%err, "dns: the zone could not be read");
-                let previous = self
-                    .last
-                    .lock()
-                    .ok()
-                    .and_then(|held| held.as_ref().cloned());
+                let previous = self.last.lock().ok().and_then(|held| held.clone());
                 match previous {
-                    Some(zone) => {
+                    Some(records) => {
                         tracing::warn!(
-                            records = zone.records.len(),
+                            records = records.len(),
                             "dns: answering from the zone read before this failure"
                         );
-                        answer_over(&zone.records, name, rtype, options)
+                        answer_over(&records, name, rtype, options)
                     }
                     None => LookupControlFlow::Continue(Err(LookupError::ResponseCode(
                         ResponseCode::ServFail,
@@ -624,8 +686,20 @@ pub async fn listen_from_directory(
     // `dns.keys` beside the entries the directory holds: both are served, and both have to parse
     // before a port is taken.
     let configured = forward.keys.clone();
+    // The signing keys, loaded here for the same reason the TSIG keys are: a key that does not load
+    // is a start-up error with the port not yet taken, rather than a zone that answers unsigned and
+    // a validator that reports it at a client, hours later.
+    let signers = crate::dns::dnssec::Signers::new(&forward.dnssec, &forward.dns_domain)?;
+    if !signers.is_empty() {
+        tracing::info!(
+            keys = ?signers.describe(),
+            "dns: the zone is signed; a validator needs one of these DNSKEYs as its trust anchor"
+        );
+    }
+    let signers = Arc::new(signers);
     let in_directory = InDirectory::new(Arc::clone(&source), base_dn, dns_name)
-        .with_configured_keys(configured.clone());
+        .with_configured_keys(configured.clone())
+        .with_signers(Arc::clone(&signers));
     match in_directory.read().await {
         Ok(zone) => {
             if !zone.unserved.is_empty() {

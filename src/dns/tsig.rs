@@ -103,8 +103,26 @@ impl Keys {
         request: &Request,
         now: u64,
     ) -> (Result<(), ResponseCode>, Option<TSigResponseContext>) {
+        let (verdict, context) = self.verified(request, now);
+        (verdict.map(|_| ()), context)
+    }
+
+    /// The same check, saying **which** key it was.
+    ///
+    /// `Ok(None)` is a request that carried no signature and did not need one; `Ok(Some(name))` is a
+    /// signature that verified under a key this server holds. A policy that distinguishes clients by
+    /// key - a zone transfer, first of them - cannot be written against `authorize`, because "did not
+    /// sign" and "signed correctly" both come back as `Ok(())` there.
+    pub fn verified(
+        &self,
+        request: &Request,
+        now: u64,
+    ) -> (
+        Result<Option<&hickory_server::proto::rr::Name>, ResponseCode>,
+        Option<TSigResponseContext>,
+    ) {
         let Some(signature) = request.signature.as_deref() else {
-            return (Ok(()), None);
+            return (Ok(None), None);
         };
         let id = request.metadata.id;
 
@@ -158,7 +176,7 @@ impl Keys {
         }
 
         (
-            Ok(()),
+            Ok(Some(signer.signer_name())),
             Some(TSigResponseContext::new(
                 id,
                 now,

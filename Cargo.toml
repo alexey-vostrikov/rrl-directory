@@ -170,6 +170,10 @@ tower = { version = "0.5.3", features = ["util"] }
 # `dnssec-ring` because `tests/dns_dnssec.rs` verifies the signatures this server makes, with the
 # same code a validator uses - a signature nobody checks is a signature nobody knows is wrong.
 hickory-server = { version = "0.26.3", default-features = false, features = ["dnssec-ring"] }
+# `tests/dns_axfr.rs` decides on the address the connection arrives from, and this toolchain has no
+# `std::net::TcpSocket` to bind the client side with. The test that would otherwise be written - call
+# the policy function with an address - passes while the handler reads the wrong field.
+socket2 = "0.6.5"
 
 # A local copy of rasn-ldap with the RFC 4511 result codes upstream is missing
 # (118-123, including assertionFailed). The patch is the enum variants only; it is

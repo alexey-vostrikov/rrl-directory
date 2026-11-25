@@ -24,13 +24,121 @@ use std::time::Duration;
 use hickory_server::proto::dnssec::rdata::DNSSECRData;
 use hickory_server::proto::op::ResponseCode;
 use hickory_server::proto::rr::{
-    LowerName, RData, Record, RecordSet, RecordType, TSigResponseContext,
+    LowerName, Name, RData, Record, RecordSet, RecordType, TSigResponseContext,
 };
 use hickory_server::server::{Request, RequestInfo, Server};
 use hickory_server::zone_handler::{
-    AuthLookup, AxfrPolicy, Catalog, LookupControlFlow, LookupError, LookupOptions, LookupRecords,
-    ZoneHandler, ZoneType,
+    AuthLookup, AxfrPolicy, AxfrRecords, Catalog, LookupControlFlow, LookupError, LookupOptions,
+    LookupRecords, ZoneHandler, ZoneTransfer, ZoneType,
 };
+
+/// The whole zone as one transfer, from the records a lookup would answer with.
+///
+/// `hickory` transfers `RecordSet`s, one per owner and type, with the `RRSIG` attached to the set it
+/// covers - so the grouping happens here rather than being handed over as a flat list. A signature in
+/// a set of its own is a signature a client cannot use: it would arrive, and prove nothing.
+///
+/// The SOA is lifted out of the list and put at both ends, which is the shape RFC 5936 §2.2 requires:
+/// a transfer starts and ends with the SOA, and a zone whose SOA also appears mid-stream is one a
+/// strict consumer can read as two.
+fn transfer_of(records: &[Record], lookup_options: LookupOptions) -> ZoneTransfer {
+    use std::collections::BTreeMap;
+
+    let mut sets: BTreeMap<(Name, RecordType), RecordSet> = BTreeMap::new();
+    let mut signatures = Vec::new();
+    for record in records {
+        if record.record_type() == RecordType::RRSIG {
+            signatures.push(record.clone());
+            continue;
+        }
+        sets.entry((record.name.clone(), record.record_type()))
+            .or_insert_with(|| RecordSet::new(record.name.clone(), record.record_type(), 0))
+            .insert(record.clone(), 0);
+    }
+    for record in signatures {
+        let covered = match &record.data {
+            RData::DNSSEC(DNSSECRData::RRSIG(rrsig)) => rrsig.input().type_covered,
+            // Not reachable through a zone this crate builds, and skipping is the honest answer: an
+            // `RRSIG` whose data is not one covers nothing this can name.
+            _ => continue,
+        };
+        if let Some(set) = sets.get_mut(&(record.name.clone(), covered)) {
+            set.insert_rrsig(record);
+        }
+    }
+
+    // A zone has exactly one `SOA`, at its apex - that is what makes it a zone.
+    let apex = sets
+        .keys()
+        .find(|(_, rtype)| *rtype == RecordType::SOA)
+        .cloned();
+    let soa = apex.and_then(|key| sets.remove(&key));
+    let (start_soa, end_soa) = match soa {
+        Some(set) => (
+            LookupRecords::new(lookup_options, Arc::new(set.clone())),
+            // The closing `SOA` is asked for without DNSSEC: it is a terminator, and a signature on
+            // it would be a signature in the middle of the stream rather than at the end where RFC
+            // 5936 puts the last record.
+            LookupRecords::new(LookupOptions::default(), Arc::new(set)),
+        ),
+        None => (LookupRecords::Empty, LookupRecords::Empty),
+    };
+
+    ZoneTransfer {
+        start_soa,
+        end_soa,
+        records: AxfrRecords::new(
+            lookup_options.dnssec_ok,
+            sets.into_values().map(Arc::new).collect(),
+        ),
+    }
+}
+
+/// Whether this request may have the zone, and why not.
+///
+/// Split out because both handlers ask it and neither can answer it alone: the source address comes
+/// from the request, the key from the signature, and the verdict from the configuration. `Err` carries
+/// the response code and the context that signs it, which is `None` for a request that never signed.
+fn permitted(
+    request: &Request,
+    info: &RequestInfo<'_>,
+    keys: &crate::dns::tsig::Keys,
+    allow: &crate::dns::axfr::Allow,
+    now: u64,
+) -> (Result<(), ResponseCode>, Option<TSigResponseContext>) {
+    let (verdict, context) = keys.verified(request, now);
+    if let Err(code) = verdict {
+        // The signature was meant to prove something and did not. `NOTAUTH` with the matching TSIG
+        // error is what the client needs to fix its own side; `REFUSED` would say "not for you".
+        tracing::warn!(client = %info.src.ip(), id = info.metadata.id, "dns: a signed transfer did not verify");
+        return (Err(code), context);
+    }
+    let key = verdict.ok().flatten();
+    match allow.matched(info.src.ip(), key) {
+        Some(grant) => {
+            tracing::info!(
+                client = %info.src.ip(),
+                key = ?key.map(hickory_server::proto::rr::Name::to_ascii),
+                grant,
+                id = info.metadata.id,
+                "dns: a zone transfer was permitted"
+            );
+            (Ok(()), context)
+        }
+        None => {
+            // Refused, and refused loudly: a silent refusal is a backup that stops working and a
+            // person who finds out when they need the backup.
+            tracing::warn!(
+                client = %info.src.ip(),
+                key = ?key.map(hickory_server::proto::rr::Name::to_ascii),
+                signed = key.is_some(),
+                id = info.metadata.id,
+                "dns: a zone transfer was refused: no dns.axfr.allow entry covers this client"
+            );
+            (Err(ResponseCode::Refused), context)
+        }
+    }
+}
 
 /// How long a TCP connection may sit between requests before it is closed.
 ///
@@ -54,6 +162,9 @@ pub struct InMemory {
     /// The keys a signed request may use. Empty unless somebody set them, which is what a test and
     /// a stand without keys look like.
     keys: Arc<crate::dns::tsig::Keys>,
+    /// Who may transfer the zone. Deny-all unless somebody set it, which is the behaviour this had
+    /// before the policy existed.
+    axfr: Arc<crate::dns::axfr::Allow>,
 }
 
 impl InMemory {
@@ -67,6 +178,7 @@ impl InMemory {
             origin: Some(origin),
             records,
             keys: Arc::new(crate::dns::tsig::Keys::none()),
+            axfr: Arc::new(crate::dns::axfr::Allow::deny_all()),
         })
     }
 
@@ -74,6 +186,13 @@ impl InMemory {
     #[must_use]
     pub fn with_keys(mut self, keys: Arc<crate::dns::tsig::Keys>) -> Self {
         self.keys = keys;
+        self
+    }
+
+    /// The same zone, transferable by the clients `allow` names.
+    #[must_use]
+    pub fn with_axfr(mut self, allow: Arc<crate::dns::axfr::Allow>) -> Self {
+        self.axfr = allow;
         self
     }
 
@@ -120,9 +239,33 @@ fn answer_over(
     if found.is_empty() {
         // A name this zone knows with other types is not NXDOMAIN: telling a client the name does
         // not exist would stop it asking for the type that does.
-        let known = records
+        //
+        // "Knows" includes the names that hold nothing themselves and exist because something is
+        // below them - an empty non-terminal, `_msdcs` above `_ldap._tcp.dc._msdcs`. The `NSEC3` chain
+        // publishes one for each of them (RFC 5155 §7.1), so answering `NXDOMAIN` for such a name
+        // hands a validator a denial that contradicts the chain it was given: measured with `delv`,
+        // which answered `broken trust chain` for `_msdcs.ad.example.com` while every other name
+        // validated. The proof was right and the code was not.
+        // The hashed owners of the chain are not names of the zone, and counting them as ancestors
+        // would make `x.<hash>.ad.example.com` "exist". They are the one kind of owner here that has
+        // to be left out.
+        let hashed: Vec<LowerName> = records
             .iter()
-            .any(|record| LowerName::from(record.name.clone()) == *name);
+            .filter(|record| record.record_type() == RecordType::NSEC3)
+            .map(|record| LowerName::from(record.name.clone()))
+            .collect();
+        let known = records.iter().any(|record| {
+            let owner = LowerName::from(record.name.clone());
+            if hashed.contains(&owner) {
+                return false;
+            }
+            // `name.zone_of(owner)` is "the query is the same as or above this owner", which is the
+            // relation an empty non-terminal has to the records below it. Written the other way round
+            // it is true for the apex and every name in the zone, so every miss became `NODATA` with a
+            // denial that proved `NXDOMAIN` - measured with `delv`: `nosuch` came back `broken trust
+            // chain` where it had validated a minute earlier.
+            owner == *name || name.zone_of(&owner)
+        });
         return if known {
             LookupControlFlow::Continue(Err(LookupError::NameExists))
         } else {
@@ -181,10 +324,30 @@ impl ZoneHandler for InMemory {
         ZoneType::Primary
     }
 
+    /// `hickory` 0.26.3 declares `axfr_policy` but never consults it on this path - the trait's
+    /// default `zone_transfer` answers `NotImp` - so the decision is made here instead.
     fn axfr_policy(&self) -> AxfrPolicy {
-        // No zone transfer: the records live in a directory that replicates them by its own means,
-        // and an AXFR would be a second, unreplicated copy of the same data.
         AxfrPolicy::Deny
+    }
+
+    async fn zone_transfer(
+        &self,
+        request: &Request,
+        lookup_options: LookupOptions,
+        now: u64,
+    ) -> Option<(
+        Result<ZoneTransfer, LookupError>,
+        Option<TSigResponseContext>,
+    )> {
+        let info = match request.request_info() {
+            Ok(info) => info,
+            Err(err) => return Some((Err(err), None)),
+        };
+        let (verdict, context) = permitted(request, &info, &self.keys, &self.axfr, now);
+        if let Err(code) = verdict {
+            return Some((Err(LookupError::ResponseCode(code)), context));
+        }
+        Some((Ok(transfer_of(&self.records, lookup_options)), context))
     }
 
     fn origin(&self) -> &LowerName {
@@ -483,6 +646,8 @@ pub struct FromSource {
     proof: Option<hickory_server::dnssec::NxProofKind>,
     /// The keys and the chain parameters, so a denial can be built without asking the source twice.
     signers: std::sync::Arc<crate::dns::dnssec::Signers>,
+    /// Who may transfer this zone.
+    axfr: Arc<crate::dns::axfr::Allow>,
 }
 
 impl FromSource {
@@ -504,7 +669,15 @@ impl FromSource {
             last: std::sync::Mutex::new(None),
             proof: None,
             signers: std::sync::Arc::new(crate::dns::dnssec::Signers::none()),
+            axfr: Arc::new(crate::dns::axfr::Allow::deny_all()),
         })
+    }
+
+    /// The same handler, transferable by the clients `allow` names.
+    #[must_use]
+    pub fn with_axfr(mut self, allow: Arc<crate::dns::axfr::Allow>) -> Self {
+        self.axfr = allow;
+        self
     }
 
     /// The same handler, signing and proving with `signers`.
@@ -574,9 +747,44 @@ impl ZoneHandler for FromSource {
     }
 
     fn axfr_policy(&self) -> AxfrPolicy {
-        // The same reason `InMemory` denies it: the records are the directory's, and a transfer
-        // would be a second copy that nobody replicates.
+        // Unread by `hickory` 0.26.3 on this path; the decision is in `zone_transfer` below.
         AxfrPolicy::Deny
+    }
+
+    async fn zone_transfer(
+        &self,
+        request: &Request,
+        lookup_options: LookupOptions,
+        now: u64,
+    ) -> Option<(
+        Result<ZoneTransfer, LookupError>,
+        Option<TSigResponseContext>,
+    )> {
+        let info = match request.request_info() {
+            Ok(info) => info,
+            Err(err) => return Some((Err(err), None)),
+        };
+        // The keys as they stand now, not as they stood at start: a key added to the directory
+        // works for a transfer without a restart, and the same is true of one removed.
+        let keys = self.source.keys().await;
+        let (verdict, context) = permitted(request, &info, &keys, &self.axfr, now);
+        if let Err(code) = verdict {
+            return Some((Err(LookupError::ResponseCode(code)), context));
+        }
+
+        // The zone as a lookup would answer it, signed - so a client transferring gets the same
+        // records, with the same signatures, that it would get one name at a time.
+        let records = match self.source.signed().await {
+            Ok(records) => records,
+            Err(err) => {
+                tracing::error!(error = %err, "dns: the zone could not be read for a transfer");
+                return Some((
+                    Err(LookupError::ResponseCode(ResponseCode::ServFail)),
+                    context,
+                ));
+            }
+        };
+        Some((Ok(transfer_of(&records, lookup_options)), context))
     }
 
     fn origin(&self) -> &LowerName {
@@ -760,9 +968,14 @@ pub async fn listen_from_directory(
     if !keys.is_empty() {
         tracing::info!(keys = ?keys.names(), "dns: signed requests are checked against these keys");
     }
+    let axfr = Arc::new(forward.axfr.clone());
+    if !axfr.is_empty() {
+        tracing::info!("dns: the zone may be transferred by the clients dns.axfr.allow names");
+    }
     let handler = FromSource::new(Arc::new(in_directory), dns_name)
         .ok_or_else(|| format!("dns zone '{dns_name}' is not a DNS name"))?
-        .with_signers(Arc::clone(&signers));
+        .with_signers(Arc::clone(&signers))
+        .with_axfr(axfr);
     let handler = Arc::new(handler);
     let ours = handler.origin().clone();
     let catalog = catalog_from(Arc::clone(&handler));

@@ -87,6 +87,7 @@ fn signers() -> Signers {
             keys: vec![KeyConfig {
                 algorithm: "ecdsa-p256-sha256".to_string(),
                 file: key_path(),
+                role: None,
             }],
             signature_days: None,
             // Positive answers only: the denials have their own test, and a chain here would make
@@ -435,6 +436,7 @@ fn the_nsec3_chain_is_signed_and_its_signatures_verify() {
             keys: vec![KeyConfig {
                 algorithm: "ecdsa-p256-sha256".to_string(),
                 file: key_path(),
+                role: None,
             }],
             signature_days: None,
             nsec3: Some(rrl_directory::dns::dnssec::Nsec3Config {
@@ -517,6 +519,7 @@ fn every_algorithm_this_build_offers_signs_and_verifies() {
                 keys: vec![KeyConfig {
                     algorithm: name.to_string(),
                     file: key_file(fixture),
+                    role: None,
                 }],
                 signature_days: None,
                 nsec3: None,
@@ -572,6 +575,82 @@ fn every_algorithm_this_build_offers_signs_and_verifies() {
     }
 }
 
+/// The `DNSKEY` RRset is signed by the `KSK` and the rest by the `ZSK`, and only that way.
+///
+/// RFC 4035 §2.1.2, and the reason it matters here: a validator that finds no `ZSK` for an algorithm
+/// treats the zone as improperly signed - `dnssec-verify` says `Missing ZSK for algorithm …` and
+/// refuses the whole zone, which is what this zone did until the roles existed. The flags are the
+/// other half: a `ZSK` publishes 256, a `KSK` 257, and a validator reads them to decide which key was
+/// supposed to have signed what.
+#[test]
+fn the_key_signs_the_keys_and_the_zone_signs_the_rest() {
+    let signers = Signers::new(
+        &DnssecConfig {
+            keys: vec![
+                KeyConfig {
+                    algorithm: "ecdsa-p256-sha256".to_string(),
+                    file: key_file("rrl-dnssec-test-p256.der"),
+                    role: Some("ksk".to_string()),
+                },
+                KeyConfig {
+                    algorithm: "ecdsa-p384-sha384".to_string(),
+                    file: key_file("rrl-dnssec-test-p384.der"),
+                    role: Some("zsk".to_string()),
+                },
+            ],
+            signature_days: None,
+            nsec3: None,
+        },
+        DOMAIN,
+    )
+    .expect("both keys load");
+
+    let signed = signers.sign(&records(), now()).expect("the zone signs");
+
+    let flags: Vec<u16> = signed
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::DNSSEC(DNSSECRData::DNSKEY(key)) => Some(key.flags()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(flags.len(), 2, "both keys are published");
+    assert!(
+        flags.contains(&257) && flags.contains(&256),
+        "one KSK and one ZSK: {flags:?}"
+    );
+
+    // The key tag of the signature says which key made it, and that is the whole assertion: the
+    // `DNSKEY` set carries the `KSK`'s tag, every other set the `ZSK`'s.
+    let mut by_type: std::collections::BTreeMap<String, Vec<u16>> =
+        std::collections::BTreeMap::new();
+    for record in &signed {
+        let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = &record.data else {
+            continue;
+        };
+        by_type
+            .entry(format!("{:?}", sig.input().type_covered))
+            .or_default()
+            .push(sig.input().key_tag);
+    }
+    let dnskey_tags = by_type.get("DNSKEY").expect("the key set is signed");
+    assert_eq!(
+        dnskey_tags.len(),
+        1,
+        "signed by one key, not both: {dnskey_tags:?}"
+    );
+    for (covered, tags) in &by_type {
+        if covered == "DNSKEY" {
+            continue;
+        }
+        assert_eq!(tags.len(), 1, "{covered} is signed once: {tags:?}");
+        assert_ne!(
+            tags[0], dnskey_tags[0],
+            "{covered} is signed by the ZSK and the DNSKEY by the KSK, never the same key"
+        );
+    }
+}
+
 /// Two keys sign, and both signatures verify: that is what a rollover looks like from outside.
 #[test]
 fn two_keys_both_sign_during_a_rollover() {
@@ -580,10 +659,12 @@ fn two_keys_both_sign_during_a_rollover() {
             KeyConfig {
                 algorithm: "ecdsa-p256-sha256".to_string(),
                 file: key_path(),
+                role: None,
             },
             KeyConfig {
                 algorithm: "ecdsa-p256-sha256".to_string(),
                 file: key_path(),
+                role: None,
             },
         ],
         signature_days: Some(7),
@@ -652,6 +733,7 @@ async fn a_running_listener_serves_a_verifiable_signature() {
         zones_dir: std::path::PathBuf::from("/dns"),
         keys: Vec::new(),
         dnssec: Default::default(),
+        axfr: Default::default(),
     };
     let running = listen(
         "127.0.0.1:0".parse().expect("an address"),

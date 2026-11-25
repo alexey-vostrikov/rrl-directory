@@ -53,6 +53,35 @@ pub struct DnsConfig {
     /// Empty means no request can be signed and every signature is refused as `BADKEY` - which is
     /// the honest answer for a server that holds no keys, and not a quiet acceptance.
     pub keys: Vec<TsigKeyConfig>,
+    /// Who may copy the whole zone, AXFR.
+    ///
+    /// Empty denies everybody, which is what every deployment got before this existed. A transfer is
+    /// not a second copy of the data to be ashamed of: it is what a backup host takes, what a
+    /// secondary serves while this one restarts, and what every zone validator reads. See
+    /// [`crate::dns::axfr`] for the shape and the reasoning.
+    pub axfr: AxfrConfig,
+}
+
+/// The `dns.axfr` section as it is written.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AxfrConfig {
+    /// The entries that permit a transfer. Any one of them is enough.
+    pub allow: Vec<AxfrAllowConfig>,
+}
+
+/// One `dns.axfr.allow` entry as it is written.
+///
+/// Both fields are optional and an entry with neither is refused at start: the pair means "these
+/// addresses" and "this key", and naming one thing the entry does not constrain is how a policy ends
+/// up allowing more than its author read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AxfrAllowConfig {
+    /// An address or a network: `10.0.0.5`, `10.0.0.0/8`, `2001:db8::/32`.
+    pub source: Option<String>,
+    /// The name of a key from `dns.keys`, which the client has to prove it holds.
+    pub key: Option<String>,
 }
 
 /// One `dns.keys` entry as it is written.
@@ -120,6 +149,8 @@ pub struct Settings {
     pub zones_dir: PathBuf,
     /// The keys a signed request may use, resolved.
     pub keys: Vec<TsigKey>,
+    /// Who may transfer the zone, resolved against those keys.
+    pub axfr: crate::dns::axfr::Allow,
     /// The `dns.dnssec` section as written. The keys are loaded by the listener, where a failure is
     /// a start-up error with a port not yet taken, and where `Signers` can hold the key material
     /// without this type having to be `Clone`.
@@ -200,6 +231,12 @@ impl Settings {
             },
         };
 
+        // Resolved before the allowlist because the allowlist names keys: a grant for a key that
+        // does not resolve is a typo, and it is caught here rather than by a client being told
+        // `REFUSED` with nothing to report.
+        let keys = resolve_keys(&config.keys)?;
+        let axfr = crate::dns::axfr::Allow::resolve(&config.axfr.allow, &keys, |key| &key.name)?;
+
         Ok(Settings {
             bind: SocketAddr::new(bind_ip, port),
             dns_domain,
@@ -210,7 +247,8 @@ impl Settings {
                 .zones_dir
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("/dns")),
-            keys: resolve_keys(&config.keys)?,
+            keys,
+            axfr,
             dnssec: config.dnssec.clone(),
         })
     }

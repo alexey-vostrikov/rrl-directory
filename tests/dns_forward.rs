@@ -130,6 +130,7 @@ fn settings(
         // be verified by anything.
         keys: Vec::new(),
         dnssec: Default::default(),
+        axfr: Default::default(),
     }
 }
 

@@ -116,6 +116,32 @@ pub fn chain(
         }
     }
 
+    // Empty non-terminals. A name that holds no records but has children exists - it answers `NODATA`
+    // rather than `NXDOMAIN` - and RFC 5155 §7.1 requires it to have an `NSEC3` of its own, with an
+    // empty type bitmap. Leaving them out is a chain that proves the wrong things: measured against
+    // `dnssec-verify`, which named every one of them as missing (`_msdcs.ad.example.com`, `_tcp._msdcs`,
+    // and eleven more) while `delv` was content, because every proof this server *builds* was
+    // self-consistent. A full-zone check is what sees the difference.
+    let below: Vec<(String, Name)> = types
+        .values()
+        .map(|(name, _)| (name.to_ascii().to_ascii_lowercase(), name.clone()))
+        .collect();
+    for (_, name) in below {
+        let mut parent = name.base_name();
+        // Each step removes a label, so this terminates at the origin; the guard is for a name that
+        // is not below the origin at all, which nothing should hand over and nothing should hang on.
+        for _ in 0..64 {
+            if parent == *origin || !origin.zone_of(&parent) {
+                break;
+            }
+            let key = parent.to_ascii().to_ascii_lowercase();
+            types
+                .entry(key)
+                .or_insert_with(|| (parent.clone(), Vec::new()));
+            parent = parent.base_name();
+        }
+    }
+
     let mut links = Vec::with_capacity(types.len());
     for (_, (name, mut types)) in types {
         types.sort();
@@ -134,18 +160,20 @@ pub fn chain(
         // wrapping would leave the highest hash unable to prove anything after it.
         let next = &links[(index + 1) % links.len()].hash;
         let mut bitmap = link.types.clone();
-        // The `NSEC3` owner itself holds an `NSEC3`, and the set is signed - both are types a
-        // validator reads from the bitmap, and leaving them out is the commonest way to make a
-        // denial unprovable.
-        if !bitmap.contains(&RecordType::NSEC3) {
-            bitmap.push(RecordType::NSEC3);
-        }
+        // **Not** `NSEC3`. The bitmap describes the types at the *original* owner name, and the
+        // `NSEC3` record lives at the hashed one - so the original name holds no `NSEC3` and the bit
+        // must not be set. Measured against `dnssec-signzone` on this zone: its bitmaps carry
+        // `A NS SOA RRSIG DNSKEY NSEC3PARAM` where ours carried `NSEC3` as well, and `dnssec-verify`
+        // called every one of the sixteen a mismatch.
+        //
+        // An empty non-terminal has no records at all, so its bitmap stays empty: not even `RRSIG`,
+        // which is what `dnssec-signzone` publishes for the thirteen such names here.
         // Every RRset of a signed zone carries an `RRSIG`, and the bitmap has to say so - but the
         // bitmap must not depend on *when* the chain is built. The first version read the types off
         // the records, so a chain built before signing had no `RRSIG` in it and a chain built after
         // did: the second one was a different RRset from the one that had been signed, and every
         // `RRSIG` over `NSEC3` failed to verify. That is the whole reason `signed` is a parameter.
-        if signed && !bitmap.contains(&RecordType::RRSIG) {
+        if signed && !link.types.is_empty() && !bitmap.contains(&RecordType::RRSIG) {
             bitmap.push(RecordType::RRSIG);
         }
         if bitmap.contains(&RecordType::ANY) {
@@ -339,16 +367,20 @@ mod tests {
         ]
     }
 
-    /// Every name gets one link, the links are a ring in hash order, and each bitmap names the types
-    /// at its owner plus `NSEC3` itself.
+    /// Every name gets one link - including the empty non-terminal - the links are a ring in hash
+    /// order, and each bitmap names the types at its owner and **not** `NSEC3`.
     #[test]
     fn the_chain_covers_every_name_and_closes_into_a_ring() {
         let params = Params::default();
         let links = chain(&origin(), &zone(), &params, 600, false).expect("the chain builds");
+        // Five and not four: `inner` holds nothing and exists because `deep.inner` is below it, and
+        // RFC 5155 §7.1 gives it a link of its own. The first version of this test asserted four,
+        // which pinned the omission in place - `dnssec-verify` named thirteen such names in the real
+        // zone and this suite was green through all of them.
         assert_eq!(
             links.len(),
-            4,
-            "one link per name: apex, dc1, host, deep.inner"
+            5,
+            "one link per name: apex, dc1, host, deep.inner, and the empty inner"
         );
 
         let mut hashes = Vec::new();
@@ -362,10 +394,18 @@ mod tests {
                     .decode(first)
                     .expect("base32hex"),
             );
+            // `NSEC3` is not one of them: the record lives at the hashed owner, and the bitmap
+            // describes the original name. Asserting the opposite is what `dnssec-verify` rejected on
+            // every link of a real zone (`Bad NSEC3 record …, bit map mismatch`).
             assert!(
-                nsec3.type_set().contains(RecordType::NSEC3),
-                "the bitmap names NSEC3 itself"
+                !nsec3.type_set().contains(RecordType::NSEC3),
+                "the bitmap describes the owner, which holds no NSEC3"
             );
+            if nsec3.type_set().iter().next().is_none() {
+                // The empty non-terminal has no types at all, and not even `RRSIG` - which is what
+                // `dnssec-signzone` publishes for such a name.
+                continue;
+            }
             assert!(
                 nsec3.type_set().contains(RecordType::A),
                 "and the types at the owner"
@@ -395,6 +435,49 @@ mod tests {
             .expect("a denial")
             .expect("the chain can prove it");
         assert_eq!(proof.len(), 1, "NODATA needs the owner's own NSEC3");
+    }
+
+    /// An empty non-terminal: a link of its own, an empty bitmap, and a one-record `NODATA` proof.
+    ///
+    /// The three halves of the same fact. A name that exists only because something is below it has
+    /// to be in the chain (or a validator cannot tell it from a missing one), its bitmap has to be
+    /// empty (it holds nothing), and a query for it has to be answered `NODATA` with that link and
+    /// not `NXDOMAIN` - answering `NXDOMAIN` while publishing the link is a denial the validator
+    /// reads as a contradiction, which is `broken trust chain` at `delv`.
+    #[test]
+    fn an_empty_non_terminal_has_a_link_an_empty_bitmap_and_proves_nodata() {
+        let params = Params::default();
+        let links = chain(&origin(), &zone(), &params, 600, false).expect("the chain builds");
+
+        let wanted = hash(&origin(), &name("inner"), &params).expect("the hash");
+        let link = links
+            .iter()
+            .find(|record| {
+                record
+                    .name
+                    .iter()
+                    .next()
+                    .and_then(|label| data_encoding::BASE32_DNSSEC.decode(label).ok())
+                    .is_some_and(|decoded| decoded == wanted)
+            })
+            .expect("the empty non-terminal is in the chain");
+        let RData::DNSSEC(DNSSECRData::NSEC3(nsec3)) = &link.data else {
+            panic!("an NSEC3 record holds NSEC3 data");
+        };
+        assert!(
+            nsec3.type_set().iter().next().is_none(),
+            "a name with no records has no types in its bitmap: {:?}",
+            nsec3.type_set()
+        );
+
+        let proof = denial(&origin(), &links, &name("inner"), RecordType::A, &params)
+            .expect("a denial")
+            .expect("the chain can prove it");
+        assert_eq!(
+            proof.len(),
+            1,
+            "NODATA for an empty non-terminal is its own link, and nothing else"
+        );
     }
 
     /// A name that does not exist: three records - next closer, closest encloser, wildcard.

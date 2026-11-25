@@ -98,8 +98,20 @@ const KEY_TTL: u32 = 3600;
 pub struct KeyConfig {
     /// `ecdsa-p256-sha256` (13), `ecdsa-p384-sha384` (14), `ed25519` (15) - or the number.
     pub algorithm: String,
-    /// The private key in PKCS#8 DER: what `openssl genpkey -outform DER` writes.
+    /// The private key in PKCS#8 DER, or PEM: what `openssl genpkey` and a secret store write.
     pub file: PathBuf,
+    /// What this key is for: `ksk`, `zsk`, or `both` when it is not said.
+    ///
+    /// The distinction is RFC 4035 §2.1.2 and it is not cosmetic: a `KSK` signs the `DNSKEY` RRset
+    /// and nothing else, a `ZSK` signs everything else, and a validator that finds no `ZSK` for an
+    /// algorithm treats the zone as improperly signed - `dnssec-verify` says so in exactly those
+    /// words (`Missing ZSK for algorithm ECDSAP256SHA256`) and refuses the whole zone.
+    ///
+    /// `both` keeps the behaviour a single key had before this existed, which is what a stand wants.
+    /// A real zone wants the split: the `KSK` is the key the parent's `DS` names, so it is the one
+    /// that has to be kept offline, and a rollover that touches it touches the parent too.
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// The `dns.dnssec` section.
@@ -134,6 +146,40 @@ pub struct Key {
     signer: DnssecSigner,
     key_tag: u16,
     algorithm: Algorithm,
+    role: Role,
+}
+
+/// What a key is allowed to sign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Role {
+    /// The `DNSKEY` RRset, and only it.
+    Ksk,
+    /// Everything except the `DNSKEY` RRset.
+    Zsk,
+    /// Both, which is what one key in a zone does and what every earlier version of this file did.
+    #[default]
+    Both,
+}
+
+impl Role {
+    fn parse(text: Option<&str>) -> Result<Self, String> {
+        match text.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("both") | Some("") => Ok(Self::Both),
+            Some("ksk") => Ok(Self::Ksk),
+            Some("zsk") => Ok(Self::Zsk),
+            Some(other) => Err(format!(
+                "dns.dnssec.keys names role '{other}': a key is ksk, zsk or both"
+            )),
+        }
+    }
+
+    fn signs_dnskeys(self) -> bool {
+        matches!(self, Self::Ksk | Self::Both)
+    }
+
+    fn signs_the_rest(self) -> bool {
+        matches!(self, Self::Zsk | Self::Both)
+    }
 }
 
 /// By tag and algorithm, never by material: `DnssecSigner` holds the private key and has no `Debug`
@@ -144,6 +190,7 @@ impl std::fmt::Debug for Key {
             .debug_struct("Key")
             .field("key_tag", &self.key_tag)
             .field("algorithm", &self.algorithm)
+            .field("role", &self.role)
             .finish()
     }
 }
@@ -218,10 +265,13 @@ impl Key {
         let public_key = boxed
             .to_public_key()
             .map_err(|err| format!("{}: {err}", config.file.display()))?;
-        // `DNSKEY::from_key` sets flags 257: the zone bit (256) and the SEP bit (1). SEP is what a
-        // parent's `DS` points at, and a single key that both signs the zone and stands in for it is
-        // what a zone with one key has - a two-key KSK/ZSK split is RRL-2.25.11.
-        let dnskey = DNSKEY::from_key(&public_key);
+        let role = Role::parse(config.role.as_deref())?;
+        // The flags are the role: `zone_key` is bit 256 and `secure_entry_point` is bit 1, so a `ZSK`
+        // publishes 256 and a `KSK` 257. RFC 4034 §2.1.1 - and the flag is what a validator (and
+        // `dnssec-verify`) reads to decide which key is supposed to have signed what.
+        // `to_public_key` already hands back a `PublicKeyBuf`, so it goes into the constructor as it
+        // is: building another one would copy the bytes to say the same thing.
+        let dnskey = DNSKEY::new(true, role.signs_dnskeys(), false, public_key);
 
         // The signer name is the zone apex: it is what an `RRSIG` names as the owner of the key, and
         // a validator picks the `DNSKEY` to try by it.
@@ -237,7 +287,18 @@ impl Key {
             signer,
             key_tag,
             algorithm,
+            role,
         })
+    }
+
+    /// Whether this key signs the `DNSKEY` RRset.
+    fn signs_dnskeys(&self) -> bool {
+        self.role.signs_dnskeys()
+    }
+
+    /// Whether this key signs everything else.
+    fn signs_the_rest(&self) -> bool {
+        self.role.signs_the_rest()
     }
 
     /// The key tag, which every `RRSIG` carries and the parent's `DS` names.
@@ -343,6 +404,42 @@ impl Signers {
             .collect()
     }
 
+    /// The keys that sign one RRset, by what the RRset is.
+    ///
+    /// RFC 4035 §2.1.2: the `KSK` signs the `DNSKEY` RRset and the `ZSK` signs everything else. Both
+    /// fall back to the other role when the zone holds no key of the right one, because a zone with
+    /// a single `KSK` still has to be signed by something - and a single key is `Both` anyway, so the
+    /// fallback only matters for a zone configured with one role on purpose.
+    fn signing_keys(&self, rtype: RecordType) -> Vec<&Key> {
+        let wants_ksk = rtype == RecordType::DNSKEY;
+        let chosen: Vec<&Key> = self
+            .keys
+            .iter()
+            .filter(|key| {
+                if wants_ksk {
+                    key.signs_dnskeys()
+                } else {
+                    key.signs_the_rest()
+                }
+            })
+            .collect();
+        if !chosen.is_empty() {
+            return chosen;
+        }
+        // No key of the expected role: the other one signs, and the zone stays signed rather than
+        // coming back with a `DNSKEY` that nothing vouches for.
+        self.keys
+            .iter()
+            .filter(|key| {
+                if wants_ksk {
+                    key.signs_the_rest()
+                } else {
+                    key.signs_dnskeys()
+                }
+            })
+            .collect()
+    }
+
     /// The zone signed: the `DNSKEY`s at the apex plus one `RRSIG` per RRset per key.
     ///
     /// `now` is seconds since the epoch. A failure returns the records **unsigned**, and the caller
@@ -382,7 +479,7 @@ impl Signers {
         let sets = rrsets(&signed)?;
         let mut rrsigs = Vec::with_capacity(sets.len() * self.keys.len());
         for set in &sets {
-            for key in &self.keys {
+            for key in self.signing_keys(set.record_type()) {
                 let rrsig = hickory_server::proto::dnssec::rdata::RRSIG::from_rrset(
                     set,
                     DNSClass::IN,
@@ -567,6 +664,7 @@ mod tests {
                     // A copy that only this process can read: the fixture in the repository is
                     // 644 after a checkout, and the loader refuses that on purpose.
                     file: private_copy("rrl-dnssec-test-p256.der"),
+                    role: None,
                 }],
                 signature_days: Some(7),
                 nsec3: None,
@@ -630,6 +728,7 @@ mod tests {
         let config = KeyConfig {
             algorithm: "ecdsa-p256-sha256".to_string(),
             file: path.clone(),
+            role: None,
         };
         let error = super::Key::load(&config, &Name::root(), std::time::Duration::from_secs(60))
             .expect_err("0644 is readable by others");

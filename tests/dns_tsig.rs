@@ -62,6 +62,8 @@ fn settings() -> Settings {
             algorithm: TsigAlgorithm::HmacSha256,
             fudge: 300,
         }],
+        // No transfer policy: these suites are about signatures, and a transfer is decided elsewhere.
+        axfr: Default::default(),
     }
 }
 

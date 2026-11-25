@@ -20,6 +20,7 @@
 //! trip through this server, and [`zone::Zone::unserved`] names the types it could not answer
 //! with.
 
+pub mod axfr;
 pub mod config;
 pub mod dnssec;
 pub mod forward;

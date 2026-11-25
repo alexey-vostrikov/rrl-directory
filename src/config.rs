@@ -1194,6 +1194,11 @@ mod tests {
         assert!(text.contains("definition 1"), "{text}");
     }
 
+    // The zone's vocabulary is published when `dns.enabled` is on, and without the `dns` feature
+    // there is no such section to turn on: the test asserted a list of classes a build that cannot
+    // serve a zone does not publish. Measured under `--features kdc`: it failed, and CI missed it
+    // because CI builds `--all-features`.
+    #[cfg(feature = "dns")]
     #[test]
     fn a_server_that_serves_a_zone_publishes_the_vocabulary_its_zone_is_written_in() {
         // Measured on a stand: a server with `dns.enabled` and no keytab refused to start on the

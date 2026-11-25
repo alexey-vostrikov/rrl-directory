@@ -608,8 +608,11 @@ mod tests {
         message
     }
 
-    #[cfg(feature = "kdc")]
-    // NTLM's keys come from the realm: without `kdc` this build cannot answer an NTLMSSP token,
+    #[cfg(all(feature = "kdc", feature = "smb"))]
+    // NTLM's keys come from the realm, and the acceptor that answers NTLMSSP lives in the SMB
+    // crate: with `kdc` alone the mechanism is refused as not offered, which is what these three
+    // tests asserted against and failed. Measured: `cargo test --features kdc --lib` had four
+    // failures, and the shipped CI never saw them because it builds `--all-features`.: without `kdc` this build cannot answer an NTLMSSP token,
     // and the test asserts what it does answer. Gated, not skipped inside — a `return` on one
     // branch is unreachable code there, and the CI lints this crate with no features on.
     #[test]

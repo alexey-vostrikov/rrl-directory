@@ -622,7 +622,12 @@ fn the_key_signs_the_keys_and_the_zone_signs_the_rest() {
 
     // The key tag of the signature says which key made it, and that is the whole assertion: the
     // `DNSKEY` set carries the `KSK`'s tag, every other set the `ZSK`'s.
-    let mut by_type: std::collections::BTreeMap<String, Vec<u16>> =
+    //
+    // **A set of tags, not a count.** The first version of this test counted signatures per type
+    // and failed under `--all-features` with `A is signed once: [54072, 54072, 54072]` - three `A`
+    // records at three owners, each signed once by the same key. The property is "one key, whichever
+    // sets it signs", and counting conflated it with "one set".
+    let mut by_type: std::collections::BTreeMap<String, std::collections::BTreeSet<u16>> =
         std::collections::BTreeMap::new();
     for record in &signed {
         let RData::DNSSEC(DNSSECRData::RRSIG(sig)) = &record.data else {
@@ -631,21 +636,27 @@ fn the_key_signs_the_keys_and_the_zone_signs_the_rest() {
         by_type
             .entry(format!("{:?}", sig.input().type_covered))
             .or_default()
-            .push(sig.input().key_tag);
+            .insert(sig.input().key_tag);
     }
     let dnskey_tags = by_type.get("DNSKEY").expect("the key set is signed");
     assert_eq!(
         dnskey_tags.len(),
         1,
-        "signed by one key, not both: {dnskey_tags:?}"
+        "the DNSKEY set is signed by one key, not both: {dnskey_tags:?}"
     );
+    let ksk = *dnskey_tags.iter().next().expect("a tag");
     for (covered, tags) in &by_type {
         if covered == "DNSKEY" {
             continue;
         }
-        assert_eq!(tags.len(), 1, "{covered} is signed once: {tags:?}");
+        assert_eq!(
+            tags.len(),
+            1,
+            "every {covered} set is signed by one key, and it is not the KSK: {tags:?}"
+        );
         assert_ne!(
-            tags[0], dnskey_tags[0],
+            *tags.iter().next().expect("a tag"),
+            ksk,
             "{covered} is signed by the ZSK and the DNSKEY by the KSK, never the same key"
         );
     }

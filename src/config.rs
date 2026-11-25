@@ -980,7 +980,17 @@ pub fn resolve(
             #[cfg(not(feature = "kdc"))]
             let runs_a_kdc = false;
 
-            if file.sasl.keytab.is_some() || runs_a_kdc {
+            // A zone is stored as `dnsNode` entries carrying `dnsRecord` values, and both classes
+            // are part of the AD vocabulary - so a server that serves a zone needs it whether or
+            // not it accepts a ticket. Left out, the server refuses to start on the entries it
+            // provisions for itself: "unknown object class 'dnsNode'", measured on a stand with
+            // `dns.enabled` and no keytab.
+            #[cfg(feature = "dns")]
+            let serves_a_zone = file.dns.enabled;
+            #[cfg(not(feature = "dns"))]
+            let serves_a_zone = false;
+
+            if file.sasl.keytab.is_some() || runs_a_kdc || serves_a_zone {
                 crate::ad_schema::extend(&mut schema).map_err(ConfigError::AdSchema)?;
             }
             #[cfg(feature = "kdc")]

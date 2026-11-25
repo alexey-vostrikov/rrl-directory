@@ -211,6 +211,49 @@ impl RealmView {
 
 impl Realm for RealmView {
     fn get(&self, principal: &Principal) -> rrl_kdc::Result<Option<Attributes>> {
+        // An account first, when one publishes this name as a service principal name.
+        //
+        // One entry per account is what AD keeps: the keys are on the account, the names are on the
+        // account, and a ticket for `HOST/host` is sealed in the account's key. Directories written
+        // before this rule hold a second entry named after the service - one `krb5Principal` per
+        // keytab line - and that entry has keys of its own, so a lookup by name finds it and answers
+        // with a key the account does not have. Measured on the stand: `kvno host/dc1` was answered
+        // from the keytab's entry and `kvno HOST/dc1` came back `SVC_UNAVAILABLE`, for one account
+        // that publishes both spellings.
+        //
+        // Asking the account first makes such an entry harmless without deleting anything: nothing
+        // reads it, because nothing gets that far.
+        let name = principal.components.join("/");
+        if name.contains('/')
+            && let Some(account) = self.first_complete(|entry| {
+                entry
+                    .attributes()
+                    .get("servicePrincipalName")
+                    .is_some_and(|attribute| {
+                        attribute
+                            .values
+                            .iter()
+                            .any(|value| value.eq_ignore_ascii_case(&name))
+                    })
+            })
+            && let Some(account_principal) = self.name_of(&account)
+        {
+            let _ = account_principal;
+            // Published under the name that was **asked for**, not the account's own: the KDC
+            // resolves a service by the name in the request and refuses an entry that calls itself
+            // something else (`the directory returned the entry for …`). The account is the key
+            // holder; the name is the client's.
+            let mut attributes = self.published(&account, principal);
+            attributes.set(attrs::PRINCIPAL_NAME, principal.to_string());
+            from_attributes(&attributes).map_err(|err| {
+                Error::Hdb(format!(
+                    "entry '{}' does not read back as a principal: {err}",
+                    account.dn()
+                ))
+            })?;
+            return Ok(Some(attributes));
+        }
+
         let Some(entry) = self.entry_for(principal) else {
             return Ok(None);
         };

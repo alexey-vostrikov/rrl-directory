@@ -181,6 +181,35 @@ pub async fn ensure_keytab_principals(
                 ));
             }
         };
+
+        // The account that publishes this name, when there is one. AD keeps exactly one entry per
+        // account: the keys are on it, the `servicePrincipalName` list is on it, and a ticket for
+        // any of those names is sealed in the account's key. A second entry named after the SPN is
+        // what made the case of the question decide which key answered.
+        let publishing = {
+            let directory = source.directory().await;
+            directory.all().iter().find_map(|entry| {
+                let names = entry.attributes().get("servicePrincipalName")?;
+                let publishes = names
+                    .values
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case(&name));
+                publishes.then(|| entry.clone())
+            })
+        };
+
+        if let Some(account) = publishing {
+            // Keys already there belong to the account's password, and a keytab copied in months ago
+            // is not a reason to replace them: the join wrote a password, the member derived its
+            // keytab from it, and overwriting one side breaks the pair.
+            if account.attributes().get(attrs::KEY).is_none() {
+                let merged = with_keys(&account, &keys, &name, realm)?;
+                changes.push(EntryChange::Upsert { entry: merged });
+                written.push(account.dn().to_string());
+            }
+            continue;
+        }
+
         // An entry already present is left alone: it may have been given a password of its own
         // through LDAP, and overwriting its keys from a file somebody copied in months ago is a
         // change no client asked for.
@@ -208,6 +237,58 @@ pub async fn ensure_keytab_principals(
             .map_err(|err| format!("writing the realm's service principals: {err}"))?;
     }
     Ok(written)
+}
+
+/// `account` with the keytab's keys added - the entry AD keeps, rather than a second one.
+///
+/// The values are written the way this server stores a key: `krb5Key` as base64 of the DER the KDC
+/// reads back, and `krb5KeyVersionNumber` so a reader knows which version the keys are. Both are what
+/// `unicode_pwd::merge_keys` writes when a password arrives, which is the point - a key that came
+/// from a keytab and a key that came from a password have to be indistinguishable afterwards, or the
+/// two paths drift.
+fn with_keys(
+    account: &Entry,
+    keys: &[(Enctype, Vec<u8>, u32)],
+    name: &str,
+    realm: &str,
+) -> Result<Entry, String> {
+    use rrl_kdc::crypto::Key;
+
+    // The account's principal, from the attribute the realm reads back: `sAMAccountName` carries no
+    // realm, and the KDC appends it.
+    let account_name = account
+        .attributes()
+        .get("sAMAccountName")
+        .and_then(|attribute| attribute.values.first())
+        .cloned()
+        .unwrap_or_else(|| {
+            name.split_once('/')
+                .map_or(name, |(_, rest)| rest)
+                .to_string()
+        });
+    let principal = Principal::parse(&format!("{account_name}@{realm}"))
+        .map_err(|err| format!("'{account_name}@{realm}' is not a principal: {err}"))?;
+
+    let mut entry = HdbEntry::service(principal);
+    for (enctype, bytes, kvno) in keys {
+        let key = Key::new(*enctype, bytes.clone())
+            .map_err(|err| format!("{name}: a key the keytab holds does not parse: {err}"))?;
+        entry.add_key(key, *kvno, None);
+    }
+
+    // Encoded by the same function the KDC reads back, so a key written here is byte for byte the
+    // key a password would have produced. Only the two attributes travel: the account's classes,
+    // its SID and everything else stay as they are.
+    let derived = attributes_of(&entry);
+    let mut attributes = account.attributes().clone();
+    for attribute in ["krb5Key", "krb5KeyVersionNumber"] {
+        if let Some(values) = derived.get(attribute) {
+            // The binary flag travels with the attribute: `attributes_of` marks `krb5Key` as binary
+            // on the way out, which is what makes it base64 in the store and in an export.
+            attributes = attributes.replace(values.clone());
+        }
+    }
+    Ok(Entry::new(account.dn().to_string(), attributes))
 }
 
 /// The realm's attributes in this server's spelling.

@@ -195,6 +195,11 @@ impl Default for Acl {
     /// Defaults keep the gorestldap model (admin sees everything, a user sees
     /// their own entry) but close the `userPassword` hole: the hash is readable by
     /// an admin only, and never through `*`.
+    ///
+    /// `rrlDnsKeySecret` is in the same rule for a different reason: it is not a hash but the shared
+    /// TSIG key itself, stored reversibly because a MAC cannot be verified against a hash. Anyone
+    /// who can read it can sign updates as that key, which makes it the one attribute in this tree
+    /// whose disclosure is a grant of authority rather than a leak of information.
     fn default() -> Self {
         Self {
             rules: vec![
@@ -207,7 +212,7 @@ impl Default for Acl {
                 Rule {
                     subject: Subject::SelfEntry,
                     base: None,
-                    attributes: vec!["userPassword".to_string()],
+                    attributes: vec!["userPassword".to_string(), "rrlDnsKeySecret".to_string()],
                     rights: Rights::none(),
                 },
                 Rule {
@@ -395,6 +400,31 @@ mod tests {
             rights: vec!["read".to_string(), "search".to_string()],
         }]))
         .expect("the rule parses")
+    }
+
+    /// The one attribute whose disclosure is a grant of authority: a readable TSIG secret lets
+    /// whoever read it sign updates as that key. It is kept out of a read by default, and an admin
+    /// still sees it - the server needs it, and so does the operator who issues keys.
+    #[test]
+    fn a_dns_key_secret_is_not_readable_by_its_owner() {
+        let acl = Acl::default();
+        let directory = directory();
+
+        assert!(
+            !acl.rights(&alice(), &directory, ALICE_DN, Some("rrlDnsKeySecret"))
+                .read,
+            "an owner must not be able to read the shared key"
+        );
+        assert!(
+            acl.rights(&admin(), &directory, ALICE_DN, Some("rrlDnsKeySecret"))
+                .read,
+            "an administrator issues keys, so reads them"
+        );
+        // And the rest of the entry is still theirs, or the rule would have closed the account.
+        assert!(
+            acl.rights(&alice(), &directory, ALICE_DN, Some("mail"))
+                .read
+        );
     }
 
     #[test]

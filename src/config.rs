@@ -993,6 +993,14 @@ pub fn resolve(
             if file.sasl.keytab.is_some() || runs_a_kdc || serves_a_zone {
                 crate::ad_schema::extend(&mut schema).map_err(ConfigError::AdSchema)?;
             }
+            // A server that serves a zone takes signed updates, and the keys those are checked
+            // against are entries in this same directory: `rrlDnsKey` has to be in the vocabulary
+            // before the first one is written, or the write is refused by the schema that is
+            // supposed to describe it.
+            #[cfg(feature = "dns")]
+            if serves_a_zone {
+                crate::dns::keys::extend(&mut schema).map_err(ConfigError::AdSchema)?;
+            }
             #[cfg(feature = "kdc")]
             if runs_a_kdc {
                 crate::kerberos::schema::extend(&mut schema).map_err(ConfigError::AdSchema)?;

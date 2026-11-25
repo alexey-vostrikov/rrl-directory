@@ -22,6 +22,7 @@
 
 pub mod config;
 pub mod forward;
+pub mod keys;
 pub mod property;
 pub mod provision;
 pub mod record;

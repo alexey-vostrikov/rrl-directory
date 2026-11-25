@@ -266,6 +266,15 @@ impl ZoneHandler for InMemory {
 pub trait ZoneSource: Send + Sync {
     /// The zone as it stands now.
     async fn read(&self) -> Result<crate::dns::zone::Zone, crate::dns::zone::Error>;
+
+    /// The keys a signed request may use, as they stand now.
+    ///
+    /// Default: none. A source that holds no directory - a zone handed over at start - cannot have
+    /// keys, and answering `none` is the honest thing rather than an empty set pretending to be a
+    /// decision.
+    async fn keys(&self) -> Arc<crate::dns::tsig::Keys> {
+        Arc::new(crate::dns::tsig::Keys::none())
+    }
 }
 
 /// The zone read out of this server's own directory, one read per query.
@@ -277,6 +286,8 @@ pub struct InDirectory {
     source: Arc<crate::reload::Source>,
     base_dn: String,
     dns_name: String,
+    /// The keys `dns.keys` names, beside the ones the directory holds.
+    configured: Vec<crate::dns::config::TsigKey>,
 }
 
 impl InDirectory {
@@ -286,7 +297,18 @@ impl InDirectory {
             source,
             base_dn: base_dn.to_string(),
             dns_name: dns_name.trim_end_matches('.').to_string(),
+            configured: Vec::new(),
         }
+    }
+
+    /// The same source, also accepting the keys `dns.keys` names.
+    ///
+    /// Both lists are served, because they answer different questions: `dns.keys` is what a machine
+    /// with no directory client can be given, and a key entry is what can be issued at runtime.
+    #[must_use]
+    pub fn with_configured_keys(mut self, configured: Vec<crate::dns::config::TsigKey>) -> Self {
+        self.configured = configured;
+        self
     }
 }
 
@@ -295,6 +317,30 @@ impl ZoneSource for InDirectory {
     async fn read(&self) -> Result<crate::dns::zone::Zone, crate::dns::zone::Error> {
         let directory = self.source.directory().await;
         crate::dns::zone::Zone::read(&directory, &self.base_dn, &self.dns_name)
+    }
+
+    /// Read on every check, so an issued key works and a deleted one stops working without a
+    /// restart. A broken entry is reported once per check at `warn` - it is the operator's typo, and
+    /// the alternative is refusing to verify every signature in the zone over it.
+    async fn keys(&self) -> Arc<crate::dns::tsig::Keys> {
+        let directory = self.source.directory().await;
+        let (from_directory, broken) = crate::dns::keys::load(&directory, &self.base_dn);
+        for reason in &broken {
+            tracing::warn!(reason, "dns: a key entry is not usable and is not accepted");
+        }
+
+        let mut keys = self.configured.clone();
+        keys.extend(from_directory);
+        match crate::dns::tsig::Keys::new(&keys) {
+            Ok(keys) => Arc::new(keys),
+            Err(err) => {
+                // A configured key that does not build is a start-up failure and was already
+                // refused there; one read from an entry that parsed but will not build is refused
+                // here rather than answering with a key set that silently lost an entry.
+                tracing::error!(%err, "dns: the key set could not be built");
+                Arc::new(crate::dns::tsig::Keys::none())
+            }
+        }
     }
 }
 
@@ -311,8 +357,6 @@ pub struct FromSource {
     origin: LowerName,
     /// What the last successful read returned, for the case above.
     last: std::sync::Mutex<Option<crate::dns::zone::Zone>>,
-    /// The keys a signed request may use, from `dns.keys`.
-    keys: Arc<crate::dns::tsig::Keys>,
 }
 
 impl FromSource {
@@ -332,15 +376,7 @@ impl FromSource {
             source,
             origin: LowerName::from(origin),
             last: std::sync::Mutex::new(None),
-            keys: Arc::new(crate::dns::tsig::Keys::none()),
         })
-    }
-
-    /// The same zone, checking signatures against `keys`.
-    #[must_use]
-    pub fn with_keys(mut self, keys: Arc<crate::dns::tsig::Keys>) -> Self {
-        self.keys = keys;
-        self
     }
 
     /// The answer, from the source if it can be read and from the previous read if it cannot.
@@ -430,7 +466,10 @@ impl ZoneHandler for FromSource {
         lookup_options: LookupOptions,
     ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
         // The same order as `InMemory`: the signature decides whether there is a question to answer.
-        let (verdict, signer) = self.keys.authorize(request, crate::dns::tsig::now());
+        // The key set is asked of the source on every check, which is what makes an issued key work
+        // and a deleted one stop working without a restart.
+        let keys = self.source.keys().await;
+        let (verdict, signer) = keys.authorize(request, crate::dns::tsig::now());
         if let Err(code) = verdict {
             return (
                 LookupControlFlow::Continue(Err(LookupError::ResponseCode(code))),
@@ -458,7 +497,8 @@ impl ZoneHandler for FromSource {
         update: &Request,
         now: u64,
     ) -> (Result<bool, ResponseCode>, Option<TSigResponseContext>) {
-        let (verdict, signer) = self.keys.authorize(update, now);
+        let keys = self.source.keys().await;
+        let (verdict, signer) = keys.authorize(update, now);
         match verdict {
             Err(code) => (Err(code), signer),
             Ok(()) => (Err(ResponseCode::Refused), signer),
@@ -511,7 +551,11 @@ pub async fn listen_from_directory(
     dns_name: &str,
     forward: crate::dns::config::Settings,
 ) -> Result<Running, String> {
-    let in_directory = InDirectory::new(Arc::clone(&source), base_dn, dns_name);
+    // `dns.keys` beside the entries the directory holds: both are served, and both have to parse
+    // before a port is taken.
+    let configured = forward.keys.clone();
+    let in_directory = InDirectory::new(Arc::clone(&source), base_dn, dns_name)
+        .with_configured_keys(configured.clone());
     match in_directory.read().await {
         Ok(zone) => {
             if !zone.unserved.is_empty() {
@@ -525,15 +569,15 @@ pub async fn listen_from_directory(
         Err(err) => return Err(format!("dns zone '{dns_name}': {err}")),
     }
     // Built here rather than inside the handler: a key that does not load is a start-up error, and
-    // this is the only place in this path that can return one.
-    let keys = crate::dns::tsig::Keys::new(&forward.keys)?;
+    // this is the only place in this path that can return one. The handler itself asks the source on
+    // every check, so an issued key needs no restart - this set is the one `Answering` answers with
+    // when it refuses a name it does not hold.
+    let keys = Arc::new(crate::dns::tsig::Keys::new(&configured)?);
     if !keys.is_empty() {
         tracing::info!(keys = ?keys.names(), "dns: signed requests are checked against these keys");
     }
-    let keys = Arc::new(keys);
     let handler = FromSource::new(Arc::new(in_directory), dns_name)
-        .ok_or_else(|| format!("dns zone '{dns_name}' is not a DNS name"))?
-        .with_keys(Arc::clone(&keys));
+        .ok_or_else(|| format!("dns zone '{dns_name}' is not a DNS name"))?;
     let handler = Arc::new(handler);
     let ours = handler.origin().clone();
     let catalog = catalog_from(Arc::clone(&handler));

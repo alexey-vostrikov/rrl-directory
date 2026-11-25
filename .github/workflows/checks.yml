@@ -82,6 +82,25 @@ jobs:
       - name: tests with every feature
         run: cargo test --all-features --all-targets
 
+      # One feature at a time, because "none" and "all" do not cover the space between them.
+      #
+      # Measured: `cargo test --features kdc` had four failures that neither step above could see.
+      # A test gated on `kdc` alone compiles under `--all-features` (where `smb` is present too) and
+      # does not compile at all without features - so the configuration it actually asserts about
+      # was the one configuration nobody built. The four were caught here, in this repository, on a
+      # laptop; the point of this step is that the next one is caught by the gate.
+      #
+      # `clippy` as well as `test`: a lint that only fires when one feature is on - an import used
+      # by one arm of a `cfg` and not another - is the same blind spot in the same place.
+      - name: each feature on its own
+        run: |
+          for feature in kdc smb dns slate-s3; do
+            echo "::group::--features $feature"
+            cargo clippy --all-targets --features "$feature" -- -D warnings
+            cargo test --features "$feature" --all-targets
+            echo "::endgroup::"
+          done
+
   load:
     runs-on: ubuntu-latest
     timeout-minutes: 30

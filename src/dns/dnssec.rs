@@ -124,6 +124,22 @@ impl Key {
             )
         })?;
 
+        // The private key is a secret like any other, and a world-readable one is a secret in name
+        // only: a `0600` file is what `master.key` beside it already is. Refused rather than warned,
+        // because a warning at start is a line nobody reads and the exposure is permanent - and it
+        // is the same call this crate makes for every other secret it holds.
+        if let Ok(metadata) = std::fs::metadata(&config.file) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return Err(format!(
+                    "dns.dnssec.keys: {} is readable by others (mode {mode:o}): a signing key has \
+                     to be 0600, or anybody on the host can sign a zone as this server",
+                    config.file.display()
+                ));
+            }
+        }
+
         let der = std::fs::read(&config.file).map_err(|err| {
             format!(
                 "dns.dnssec.keys: {} could not be read: {err}",
@@ -485,6 +501,101 @@ fn algorithm_from(text: &str) -> Option<Algorithm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signatures are made at read time, so there is nothing to re-sign and nothing to expire.
+    ///
+    /// This is the whole answer to "how is re-signing scheduled": it is not. A signature is made
+    /// over the zone as it stands, at the moment it is answered, which means (a) an RFC 2136 update
+    /// is covered by the next answer without a hook, and (b) a server that was down for a month has
+    /// no stale signature to repair on the way up - the first answer after the start carries a fresh
+    /// one. The test pins the property rather than the mechanism: two reads a second apart produce
+    /// signatures that are valid now, and none that is already expired.
+    #[test]
+    fn signatures_are_made_at_read_time_so_none_can_be_stale() {
+        let keys = crate::dns::dnssec::Signers::new(
+            &DnssecConfig {
+                keys: vec![KeyConfig {
+                    algorithm: "ecdsa-p256-sha256".to_string(),
+                    // The key this crate's own tests use, by the path the integration tests use.
+                    file: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/keys/rrl-dnssec-test-p256.der"),
+                }],
+                signature_days: Some(7),
+                nsec3: None,
+            },
+            "ad.example.com",
+        )
+        .expect("the test key loads");
+
+        let origin = Name::from_ascii("ad.example.com.").expect("a name");
+        let records = vec![Record::from_rdata(
+            origin.clone(),
+            600,
+            RData::A(hickory_server::proto::rr::rdata::A::from(
+                std::net::Ipv4Addr::new(10, 0, 2, 5),
+            )),
+        )];
+
+        // A clock a month ahead: a server that was down that long answers with a signature made now,
+        // not with one from before the outage.
+        for at in [1_700_000_000u64, 1_700_000_000 + 30 * 24 * 3600] {
+            let signed = keys.sign(&records, at).expect("the zone signs");
+            let rrsig = signed
+                .iter()
+                .find_map(|record| match &record.data {
+                    RData::DNSSEC(DNSSECRData::RRSIG(sig)) => Some(sig.clone()),
+                    _ => None,
+                })
+                .expect("a signature");
+            assert!(
+                u32::from(rrsig.input().sig_inception.get()) < at as u32,
+                "the inception is before the answer"
+            );
+            assert!(
+                u32::from(rrsig.input().sig_expiration.get()) > at as u32,
+                "the expiration is after the answer, whatever the clock read at start"
+            );
+        }
+    }
+
+    /// A key anybody on the host can read is a key anybody can sign with, so the file is refused.
+    ///
+    /// The check is on the mode, not on the owner: this server may run as one user and be started by
+    /// another, and what matters is that the octets are not readable by a third party.
+    #[test]
+    fn a_world_readable_key_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory =
+            std::env::temp_dir().join(format!("rrl-dnssec-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        let path = directory.join("key.der");
+        // A copy of the real fixture, so the only thing wrong with it is the mode.
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/keys/rrl-dnssec-test-p256.der"),
+        )
+        .expect("the fixture");
+        std::fs::write(&path, &bytes).expect("written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("mode");
+
+        let config = KeyConfig {
+            algorithm: "ecdsa-p256-sha256".to_string(),
+            file: path.clone(),
+        };
+        let error = super::Key::load(&config, &Name::root(), std::time::Duration::from_secs(60))
+            .expect_err("0644 is readable by others");
+        let text = error.to_string();
+        assert!(text.contains("readable by others"), "{text}");
+        assert!(text.contains("0600"), "it says what to do: {text}");
+
+        // And `0600` is accepted, so the check is about the mode and not about the path.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        super::Key::load(&config, &Name::root(), std::time::Duration::from_secs(60))
+            .expect("a 0600 key loads");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 
     #[test]
     fn the_three_algorithms_this_build_signs_with_are_named_and_numbered() {

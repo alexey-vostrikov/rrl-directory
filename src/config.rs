@@ -1187,6 +1187,57 @@ mod tests {
     }
 
     #[test]
+    fn a_server_that_serves_a_zone_publishes_the_vocabulary_its_zone_is_written_in() {
+        // Measured on a stand: a server with `dns.enabled` and no keytab refused to start on the
+        // entries it provisions for itself - "unknown object class 'container'", "unknown object
+        // class 'dnsNode'". The zone is stored in AD's classes, so the vocabulary has to follow
+        // from serving it, exactly as it follows from accepting a ticket.
+        let cfg = resolve(
+            Args::default(),
+            Some("base_dn: dc=ad,dc=example,dc=com\ndns:\n  enabled: true\n"),
+            no_env,
+        )
+        .expect("a document that serves a zone is a valid configuration");
+
+        for class in ["container", "dnsNode", "dnsZone"] {
+            assert!(
+                cfg.schema.class(class).is_some(),
+                "the zone is written as {class}, so the class has to be defined"
+            );
+        }
+        // `description` on the two `container` parents and `dnsRecord` on every node: the
+        // attributes, not only the classes, are what strict validation complained about.
+        for attribute in ["dnsrecord", "dnsproperty", "description", "cn"] {
+            assert!(
+                cfg.schema.attribute(attribute).is_some(),
+                "{attribute} is written into the zone and has to be defined"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_that_serves_nothing_ad_shaped_publishes_no_ad_vocabulary() {
+        // The other side of the same decision: a server with no keytab, no KDC and no zone is not
+        // standing in for a domain controller, so it should not answer for classes it never
+        // maintains. A test that only checked the positive case would pass if the vocabulary were
+        // always on, which is the opposite mistake.
+        let cfg = resolve(Args::default(), None, no_env).expect("defaults");
+
+        for class in ["container", "dnsNode", "dnsZone", "user"] {
+            assert!(
+                cfg.schema.class(class).is_none(),
+                "{class} is AD's, and this configuration serves nothing of the kind"
+            );
+        }
+        for attribute in ["dnsrecord", "userprincipalname", "samaccountname"] {
+            assert!(
+                cfg.schema.attribute(attribute).is_none(),
+                "{attribute} is AD's, and this configuration serves nothing of the kind"
+            );
+        }
+    }
+
+    #[test]
     fn defaults_apply_without_any_source() {
         let cfg = resolve(Args::default(), None, no_env).expect("defaults");
 

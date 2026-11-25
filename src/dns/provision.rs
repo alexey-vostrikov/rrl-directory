@@ -358,4 +358,46 @@ mod tests {
         };
         assert_ne!(read(&facts()).data, read(&with_later).data);
     }
+
+    /// The entries this module writes have to pass the schema the server starts with - and that
+    /// schema comes from the configuration, not from here.
+    ///
+    /// Reading the two apart is how a DNS-only server came to refuse its own zone: `config.rs`
+    /// extended the schema with the AD vocabulary only when a keytab or a KDC was configured, so
+    /// `dnsNode`, `dnsZone` and `container` were unknown classes at the moment the server tried to
+    /// load the entries it had just provisioned, and the daemon refused to start with
+    ///
+    /// ```text
+    /// unknown object class 'container'; attribute 'description' is not allowed by any object class
+    /// ```
+    ///
+    /// Nothing in the suite saw it, because the schema tests built their own `Schema::core()` plus
+    /// the vocabulary and so never ran the switch that was wrong. This test starts where the server
+    /// does, with a document, and asserts over every entry the module produces - the two `container`
+    /// parents and the zone object included, not only the nodes.
+    #[test]
+    fn the_zone_this_module_writes_passes_the_schema_a_dns_only_server_starts_with() {
+        let settings = crate::config::resolve(
+            crate::config::Args::default(),
+            // Only the zone: no keytab, no KDC. This is the configuration that failed.
+            Some("base_dn: dc=ad,dc=example,dc=com\ndns:\n  enabled: true\n  port: 15353\n"),
+            |_| None,
+        )
+        .expect("a server that serves a zone and nothing else is a valid configuration");
+
+        let entries = entries(&facts()).expect("the host is inside the zone");
+        assert!(
+            !entries.is_empty(),
+            "the module has to produce something to be checked"
+        );
+        for entry in &entries {
+            if let Err(violations) = settings.schema.check(entry) {
+                panic!(
+                    "{} is written by this module and does not pass the schema the server \
+                     starts with: {violations:?}",
+                    entry.dn()
+                );
+            }
+        }
+    }
 }

@@ -69,6 +69,47 @@ remove() {
 }
 
 removed=0
+# Before anything is deleted, the profile directory's lock is taken: `cargo` holds
+# `<target>/<profile>/.cargo-lock` for the length of a build, so a prune that waits on the same lock
+# never runs inside one.
+#
+# This is not caution, it is a defect that was measured. `find -type d -empty -delete` below used to
+# run unconditionally, and a second gate started while the first was still building deleted
+# `.fingerprint/<crate>/` a moment after cargo created it and a moment before cargo wrote into it:
+#
+#     error: failed to write `/target/debug/.fingerprint/x25519-dalek-.../invoked.timestamp`
+#     Caused by: No such file or directory
+#
+# Two runs sharing one target directory is a thing that happens here - it is what the wrapper mounts
+# for every invocation - so the lock has to be taken, and the empty-directory sweep has to go: its
+# only benefit was a tidier `du`, and its cost was breaking somebody else's build.
+locked=""
+for profile in debug release; do
+    lock="$target_cache/$profile/.cargo-lock"
+    [ -d "$target_cache/$profile" ] || continue
+    # `-w 60`: a build that holds the lock longer than a minute is one this prune has no business
+    # racing. Said out loud rather than silently skipped, because a prune that never runs and never
+    # says so is how the directory grew in the first place.
+    #
+    # No `2>/dev/null` on that `exec`: a redirection-only `exec` applies to the shell itself and for
+    # the rest of the script, so silencing it here silenced every message below - measured, as a
+    # prune that printed nothing at all and exited 0 while the lock was held.
+    exec 9>"$lock" || continue
+    if flock -w 60 9; then
+        locked="$profile"
+    else
+        echo "cargo-prune: $profile is locked by a running build, skipping it" >&2
+        exec 9>&-
+        continue
+    fi
+    break
+done
+
+if [ -z "$locked" ]; then
+    echo "cargo-prune: nothing to prune (no unlocked profile directory under $target_cache)" >&2
+    exit 0
+fi
+
 for dir in debug/deps debug/build release/deps release/build; do
     [ -d "$target_cache/$dir" ] || continue
     count=$(remove "$target_cache/$dir" ! -newermt "$cutoff")
@@ -87,12 +128,6 @@ for dir in debug/incremental release/incremental; do
         echo "cargo-prune: $dir: removed"
     fi
 done
-
-# Empty directories left behind by the deletions above: `cargo` recreates them, and a tree of empty
-# directories is what makes `du` on the next run look like something is still there.
-if [ -z "$dry_run" ]; then
-    find "$target_cache" -type d -empty -delete 2>/dev/null || true
-fi
 
 after=$(du -sk "$target_cache" 2>/dev/null | cut -f1)
 freed=$((before - after))

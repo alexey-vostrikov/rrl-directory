@@ -147,7 +147,18 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "time"] }
 # Port 88: AS-REQ, TGS-REQ, and `krbtgt/<REALM>` provisioned on first start.
 kdc = ["dep:rrl-kdc"]
 # Port 445 and the `IPC$` share a join talks to.
-smb = ["dep:smb-server"]
+#
+# `smb` implies `kdc` and `dns`, and the implication is not a convenience: a member reaches this
+# server by the `_ldap._tcp`/`_kerberos._tcp` records of the domain's own zone, and it opens port 445
+# with a ticket this server issued. An SMB listener without either is a port nothing in the domain
+# can find or authenticate to. The reverse is not true and is not declared: a realm and a zone are
+# useful on their own - a KDC in front of somebody else's DNS is the ordinary arrangement - so `kdc`
+# stands alone.
+#
+# Measured before this line: `cargo check --features smb` did not compile at all, because the LDAP
+# NTLM bind under `cfg(feature = "smb")` reads `crate::kerberos`, which does not exist there. It went
+# unnoticed because the gate built "no features" and "all features" and nothing between.
+smb = ["dep:smb-server", "kdc", "dns"]
 # Port 53 and the zone a domain lives in: the `dnsRecord` values under `CN=RRLDNS`.
 # `dep:time` for the inception and expiration of a DNSSEC signature: they travel as seconds, and
 # converting between that and a calendar date by hand is how a leap second becomes a rejected zone.

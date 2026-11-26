@@ -1636,7 +1636,11 @@ mod tests {
     /// Both parts, because they are two different statements: `mechTypes` is what the client can do,
     /// `mechToken` is what it did. A test that builds only the offer cannot tell a correct reader from
     /// one that reads the offer as the choice.
-    #[cfg(feature = "kdc")]
+    // The six below are fixtures for the two NTLMSSP-inside-SPNEGO tests, and those are gated on
+    // `all(kdc, smb)` because the acceptor lives in the SMB crate. Gated on `kdc` alone they were
+    // dead code under `--features kdc`, which `clippy -D warnings` refuses - measured, seven
+    // errors across this file and `bind.rs`.
+    #[cfg(all(feature = "kdc", feature = "smb"))]
     fn spnego_with(oids: &[&[u8]], mech: Option<&[u8]>) -> Vec<u8> {
         fn length(out: &mut Vec<u8>, len: usize) {
             if len < 0x80 {
@@ -1673,16 +1677,16 @@ mod tests {
     }
 
     /// `1.3.6.1.5.5.2`, the SPNEGO mechanism a `GSS-SPNEGO` bind names.
-    #[cfg(feature = "kdc")]
+    #[cfg(all(feature = "kdc", feature = "smb"))]
     const SPNEGO_OID: [u8; 6] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x02];
 
     /// `1.3.6.1.4.1.311.2.2.10` as OID *content*, the way `mechTypes` carries it.
-    #[cfg(feature = "kdc")]
+    #[cfg(all(feature = "kdc", feature = "smb"))]
     const NTLMSSP_OID_CONTENT: [u8; 10] =
         [0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a];
 
     /// The four mechanisms a Windows LDAP client offers, in the order it offers them.
-    #[cfg(feature = "kdc")]
+    #[cfg(all(feature = "kdc", feature = "smb"))]
     fn windows_offer() -> Vec<u8> {
         spnego_with(
             &[
@@ -1699,7 +1703,7 @@ mod tests {
     ///
     /// Kept beside the correct one so the difference is visible: this answers yes for the offer list
     /// of a client that sent a Kerberos ticket.
-    #[cfg(feature = "kdc")]
+    #[cfg(all(feature = "kdc", feature = "smb"))]
     fn offers_ntlmssp(token: &[u8]) -> bool {
         token
             .windows(NTLMSSP_OID_CONTENT.len())
@@ -1707,7 +1711,7 @@ mod tests {
     }
 
     /// An NTLM NEGOTIATE, as far as anything reading it needs: the signature and a message type.
-    #[cfg(feature = "kdc")]
+    #[cfg(all(feature = "kdc", feature = "smb"))]
     fn ntlm_negotiate() -> Vec<u8> {
         let mut token = b"NTLMSSP\0".to_vec();
         token.extend_from_slice(&1u32.to_le_bytes());

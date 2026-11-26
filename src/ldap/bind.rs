@@ -597,7 +597,10 @@ mod tests {
     /// Only what the acceptor reads: the signature, the type, empty name fields, the flags. The
     /// challenge it produces from this is not what this file checks - that the mechanism is
     /// reachable is - so the fixture is the smallest message the parser accepts.
-    #[cfg(feature = "kdc")]
+    // `all(kdc, smb)` and not `kdc`: the only test that calls this is the one asserting the NTLMSSP
+    // mechanism is reachable, and the acceptor that answers it lives in the SMB crate. Under
+    // `--features kdc` the helper was dead code, which `clippy -D warnings` refuses.
+    #[cfg(all(feature = "kdc", feature = "smb"))]
     fn negotiate() -> Vec<u8> {
         let mut message = Vec::new();
         message.extend_from_slice(b"NTLMSSP\0");

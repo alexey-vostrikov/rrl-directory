@@ -395,17 +395,33 @@ async fn serve() {
                     )],
                 )),
             };
+            // `smb` is a feature of its own and a realm does not need it: `--features kdc` builds a
+            // KDC in front of somebody else's SMB, which is an ordinary arrangement. The two values
+            // the export wants from that section are therefore optional here, and the realm's own
+            // name is what they fall back to - measured: `cargo test --features kdc --all-targets`
+            // failed to compile with `no field 'smb' on type Config`, because this block is gated on
+            // `kdc` and the field is gated on `smb`.
+            // Written as one expression per branch rather than an `Option` and an `unwrap_or`: with
+            // `smb` absent the value is a constant, and `clippy` is right that an `unwrap_or_else`
+            // over a value known to be `None` is a condition that cannot be false.
+            #[cfg(feature = "smb")]
             let netbios = config
                 .smb
                 .netbios_name
                 .clone()
                 .unwrap_or_else(|| "localhost".to_string());
+            #[cfg(not(feature = "smb"))]
+            let netbios = "localhost".to_string();
+
             let dns_host = advertised_host(&config);
+            #[cfg(feature = "smb")]
             let dns_domain = config
                 .smb
                 .dns_domain
                 .clone()
                 .unwrap_or_else(|| realm.to_ascii_lowercase());
+            #[cfg(not(feature = "smb"))]
+            let dns_domain = realm.to_ascii_lowercase();
             match rrl_directory::kerberos::keytab_export::export(
                 &backend,
                 &realm,

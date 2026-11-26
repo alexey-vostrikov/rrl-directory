@@ -23,13 +23,22 @@
 //! served for the same reason, and will be when it carries an authorization story rather than a
 //! second door.
 
+// The three below serve an SMB member and nothing else: `accounts` creates the computer account a
+// join asks for, `machine_password` writes the password `netr_ServerPasswordSet2` delivers, and
+// `secrets` hands the secure channel the keys it checks. They are gated on `smb` rather than on
+// `kdc`, and measured: under `--features kdc` alone the whole set was dead code - fourteen
+// `never used` warnings through `clippy -D warnings` - because nothing but the SMB listener and the
+// LDAP NTLM bind call them. `smb` implies `kdc` in `Cargo.toml`, so no build loses them.
+#[cfg(feature = "smb")]
 pub mod accounts;
 pub mod bootstrap;
 pub mod keytab_export;
+#[cfg(feature = "smb")]
 pub mod machine_password;
 pub mod pac_issuer;
 pub mod realm;
 pub mod schema;
+#[cfg(feature = "smb")]
 pub mod secrets;
 pub mod serve;
 pub mod unicode_pwd;

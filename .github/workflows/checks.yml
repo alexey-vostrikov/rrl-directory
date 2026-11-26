@@ -82,16 +82,20 @@ jobs:
       - name: tests with every feature
         run: cargo test --all-features --all-targets
 
-      # One feature at a time, because "none" and "all" do not cover the space between them.
+      # The configurations that are meant to exist, because "none" and "all" do not cover the space
+      # between them.
       #
       # Measured: `cargo test --features kdc` had four failures that neither step above could see.
       # A test gated on `kdc` alone compiles under `--all-features` (where `smb` is present too) and
       # does not compile at all without features - so the configuration it actually asserts about
-      # was the one configuration nobody built. The four were caught here, in this repository, on a
-      # laptop; the point of this step is that the next one is caught by the gate.
+      # was the one configuration nobody built. Measured again while adding this step: `--features
+      # smb` did not compile by itself either, and the fix was to declare what `smb` means rather
+      # than to gate the code - see `Cargo.toml`.
       #
-      # `clippy` as well as `test`: a lint that only fires when one feature is on - an import used
-      # by one arm of a `cfg` and not another - is the same blind spot in the same place.
+      # `smb` is listed although it now pulls `kdc` and `dns`: the point is that the combination is
+      # named and built, not that it is minimal. `clippy` as well as `test`, because a lint that
+      # only fires when one feature is on - an import used by one arm of a `cfg` and not another -
+      # lives in exactly this blind spot.
       - name: each feature on its own
         run: |
           for feature in kdc smb dns slate-s3; do

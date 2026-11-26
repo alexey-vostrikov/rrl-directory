@@ -7,7 +7,7 @@
 # это часть протокола, скрипты на них смотрят, и они остаются английскими.
 
 # Старт
-start.banner: "rust-rest-ldap {version}: бэкенд '{backend}', база '{base}', пользователей {users}, групп {groups}"
+start.banner: "rrl-directory {version}: бэкенд '{backend}', база '{base}', пользователей {users}, групп {groups}"
 start.danger: "ОПАСНО: конфигурация включает {settings} — подтверждено через AllowDangerousSettings"
 start.passwords: "пароли: хранение {scheme}, разрешено слабых схем: {weak}; правил ACL {rules}; простой bind без шифрования {plaintext}"
 start.listening: "ldap: слушаю {addr}"
@@ -92,7 +92,7 @@ check.schema_violation: "нарушение схемы в '{dn}': {detail}"
 error.schema_reload: "не удалось перезагрузить схему, прежняя остаётся в силе: {detail}"
 start.schema_reloaded: "схема перезагружена: типов атрибутов {attributes}, классов объектов {classes}"
 config.store_empty: "'{path}' — хранилище конфигурации, но в нём нет ни одной генерации; зафиксируйте её через --config-commit или укажите файл конфигурации"
-error.store_path_missing: "для --{command} нужен каталог хранилища: укажите его через -c /etc/rust-rest-ldap/config.d"
+error.store_path_missing: "для --{command} нужен каталог хранилища: укажите его через -c /etc/rrl-directory/config.d"
 error.store_not_a_directory: "'{path}' — не каталог; хранилище генераций это каталог, а обычный файл это конфигурация"
 error.store: "хранилище конфигурации: {detail}"
 store.done: "зафиксировано как {what}"

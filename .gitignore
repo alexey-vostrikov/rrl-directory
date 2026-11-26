@@ -2,8 +2,10 @@
 .metrics
 *.tar.gz
 !Cargo.lock
-# release binary copied out of the build container for live checks
-/rust-rest-ldap
+# release binary copied out of the build container for live checks. Named after the package, so a
+# rename of the directory had to be repeated here: a stale entry ignores a file that no longer
+# exists and lets the real binary be committed.
+/rrl-directory
 # redb files seeded for live checks
 /build
 .#*

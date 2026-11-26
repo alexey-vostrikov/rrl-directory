@@ -1,8 +1,8 @@
 # A production configuration, as a starting point rather than a default.
 #
-# Copy to /etc/rust-rest-ldap/config.yaml, then:
-#   install -m 0640 -o root -g rust-rest-ldap config.example.yaml \
-#           /etc/rust-rest-ldap/config.yaml
+# Copy to /etc/rrl-directory/config.yaml, then:
+#   install -m 0640 -o root -g rrl-directory config.example.yaml \
+#           /etc/rrl-directory/config.yaml
 #
 # Every setting below that is commented out is a choice you make, not a gap you fill later.
 
@@ -18,8 +18,8 @@ groups_ou_name: groups
 # plaintext connection as well, so older clients have a path. A configuration with
 # `use_tls: true` and no certificate is a startup error, not a silent fallback to plaintext.
 use_tls: true
-server_cert: /etc/rust-rest-ldap/server.crt
-server_key: /etc/rust-rest-ldap/server.key
+server_cert: /etc/rrl-directory/server.crt
+server_key: /etc/rrl-directory/server.key
 listen_addr: 0.0.0.0:636
 
 # Entries, and never a JSON file: the store is one transaction, so a change set covering a
@@ -27,7 +27,7 @@ listen_addr: 0.0.0.0:636
 backend: redb
 backends:
   redb:
-    path: /var/lib/rust-rest-ldap/directory.redb
+    path: /var/lib/rrl-directory/directory.redb
     # `immediate` flushes on every transaction. `eventual` is faster and loses the last
     # acknowledged writes if the machine dies; a directory is not the place for that.
     durability: immediate
@@ -54,7 +54,7 @@ passwords:
 schema:
   mode: strict
   #files:
-  #  - /etc/rust-rest-ldap/local.schema
+  #  - /etc/rrl-directory/local.schema
   # Definitions added at run time through `cn=schema,cn=config` are written here by the server,
   # in the same syntax as the files above. There is no need to edit this by hand: the entry is
   # what a client writes, and this is where the result is kept so it survives a restart.
@@ -173,7 +173,7 @@ access:
 #  # so it should outlive the slowest peer and no longer. Zero is refused: it would drop the only
 #  # record that a deletion ever happened.
 #  journal_max_age: 30d
-#  conflict_log: /var/lib/rust-rest-ldap/conflicts.jsonl
+#  conflict_log: /var/lib/rrl-directory/conflicts.jsonl
 #peers:
 #  - url: ldaps://node2.example.com:636
 #    server_id: 2
@@ -207,7 +207,7 @@ access:
 # ticket could otherwise be replayed. The SASL security layer is not implemented either - the client
 # must select "none", because TLS is where the encryption belongs.
 #sasl:
-#  keytab: /etc/rust-rest-ldap/ldap.keytab
+#  keytab: /etc/rrl-directory/ldap.keytab
 #  service_principal: ldap/host.example.com@EXAMPLE.COM
 #  realms:
 #    - name: example.com
@@ -260,7 +260,7 @@ update_interval: 300s
 # result. A deleted entry takes its own modifiersName with it, so "who deleted this" is
 # answerable only if it was written down when it happened.
 observability:
-  journal: /var/lib/rust-rest-ldap/changes.jsonl
+  journal: /var/lib/rrl-directory/changes.jsonl
   journal_stdout: false
 
 # Operator diagnostics in Russian; the text on the wire stays English.

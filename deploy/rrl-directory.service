@@ -1,18 +1,18 @@
 [Unit]
 Description=Rust REST LDAP directory server
-Documentation=https://github.com/alexey-vostrikov/rust-rest-ldap
+Documentation=https://github.com/alexey-vostrikov/rrl-directory
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=rust-rest-ldap
-Group=rust-rest-ldap
-ExecStart=/usr/local/bin/rust-rest-ldap -c /etc/rust-rest-ldap/config.yaml
+User=rrl-directory
+Group=rrl-directory
+ExecStart=/usr/local/bin/rrl-directory -c /etc/rrl-directory/config.yaml
 
 # The first administrator's password lives here, not in the unit: `systemctl show` prints
 # Environment= to any user, and a password in it is a password published.
-EnvironmentFile=-/etc/rust-rest-ldap/secrets.env
+EnvironmentFile=-/etc/rrl-directory/secrets.env
 
 Restart=on-failure
 RestartSec=5s
@@ -24,7 +24,7 @@ TimeoutStopSec=30s
 
 # State: the entry store and the change journal. Created and owned by systemd, so the
 # service needs no privilege to make them.
-StateDirectory=rust-rest-ldap
+StateDirectory=rrl-directory
 StateDirectoryMode=0750
 
 # Hardening. The server listens on two sockets and writes one database; everything else it
@@ -48,9 +48,9 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-ReadWritePaths=/var/lib/rust-rest-ldap
+ReadWritePaths=/var/lib/rrl-directory
 # Certificates are only read; keeping them under /etc needs the one path below.
-ReadOnlyPaths=/etc/rust-rest-ldap
+ReadOnlyPaths=/etc/rrl-directory
 
 # A directory server without an open file limit is a server that fails at load: each
 # client connection is a descriptor, and the default of 1024 arrives quickly.

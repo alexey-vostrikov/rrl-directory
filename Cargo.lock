@@ -4098,7 +4098,7 @@ checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 [[package]]
 name = "smb-server"
 version = "0.12.2"
-source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=main#a0aa9a13604e1c14e3ee70380d165d1b73de6ab4"
+source = "git+https://github.com/alexey-vostrikov/rrl-smb?branch=main#cf988c0021a37466a1f8f5874e9e76b62dff7c50"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",

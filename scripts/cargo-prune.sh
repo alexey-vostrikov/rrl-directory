@@ -58,11 +58,14 @@ before=$(du -sk "$target_cache" 2>/dev/null | cut -f1)
 cutoff="$age days ago"
 
 remove() {
-    if [ -n "$dry_run" ]; then
-        find "$@" -type f -print 2>/dev/null | wc -l
-        return
+    # Counted before deleting, and in both modes: a run that says "0 files removed" when it removed
+    # ten thousand is a run that teaches the operator to stop reading the message. `-print | wc -l`
+    # and then a second walk, because `find -delete` reports nothing back.
+    count=$(find "$@" -type f -print 2>/dev/null | wc -l)
+    if [ -z "$dry_run" ]; then
+        find "$@" -type f -delete 2>/dev/null || true
     fi
-    find "$@" -type f -delete 2>/dev/null || true
+    echo "$count"
 }
 
 removed=0

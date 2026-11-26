@@ -115,7 +115,7 @@ mod tests {
             base,
             "users",
             "groups",
-            crate::gpo::entries(base, "ad.example.com"),
+            crate::gpo::entries(base, "dc1.ad.example.com", "ad.example.com"),
         )
     }
 

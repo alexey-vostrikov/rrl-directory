@@ -76,11 +76,19 @@ pub async fn start(
     machine_passwords: Option<std::sync::Arc<dyn smb_server::MachinePasswords>>,
     logon_users: Option<std::sync::Arc<dyn smb_server::LogonUsers>>,
     machine_accounts: Option<std::sync::Arc<dyn smb_server::MachineAccounts>>,
+    shares: Vec<smb_server::Share>,
 ) -> Result<Running, String> {
     let mut builder = smb_server::SmbServer::builder()
         .listen(settings.bind)
         .netbios_name(settings.netbios_name.clone())
         .share_listing(true);
+
+    // The file shares the deployment asked for - `SYSVOL` today. Mounted here rather than in the
+    // library, because what they contain is rendered from the directory and the directory is this
+    // process; the library only knows a share by its name and its backend.
+    for share in shares {
+        builder = builder.share(share);
+    }
 
     if let Some(keytab) = &settings.keytab {
         builder = builder.keytab(keytab);

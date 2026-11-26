@@ -1382,12 +1382,44 @@ async fn serve() {
                     std::sync::Arc<dyn smb_server::MachineAccounts>,
                 > = None;
 
+                // `SYSVOL`: the policies as files, rendered from the snapshot being served. From the
+                // snapshot and not from a number read at start, so that the `Version=` a client
+                // compares is the `versionNumber` of the entry that snapshot holds - the two
+                // disagreeing is a policy a client skips without an error anywhere.
+                let shares = if settings.sysvol_share {
+                    let directory = source.directory().await;
+                    // The domain under the share, from the same rule that names the policies' paths:
+                    // `gPCFileSysPath` and this folder have to agree, or a client walks to a folder
+                    // that is not there.
+                    // Fail-fast and not a fallback: a share whose first folder is not the domain
+                    // `gPCFileSysPath` names is a share a client walks into and finds empty, which
+                    // reads as a policy that was never provisioned.
+                    let Some(domain) = rrl_directory::gpo::domain_of_dn(&config.base_dn) else {
+                        fatal(
+                            "SYSVOL: the base DN names no domain, so the share has no folder to serve",
+                        );
+                    };
+                    let volume = rrl_directory::sysvol::catalog::volume(
+                        directory.as_ref(),
+                        &config.base_dn,
+                        rrl_directory::sysvol::profiles::Windows,
+                    );
+                    let volume: std::sync::Arc<dyn rrl_directory::sysvol::Volume> =
+                        std::sync::Arc::new(volume);
+                    vec![rrl_directory::sysvol::share::share(
+                        volume, "SYSVOL", &domain,
+                    )]
+                } else {
+                    Vec::new()
+                };
+
                 match rrl_directory::smb::serve::start(
                     &settings,
                     machine_secrets,
                     machine_passwords,
                     logon_users,
                     machine_accounts,
+                    shares,
                 )
                 .await
                 {
@@ -1396,6 +1428,14 @@ async fn serve() {
                             "smb: serving IPC$ as {} on {}",
                             running.netbios_name, running.bind
                         );
+                        // Said out loud, because a mounted share is a port a client can read: an
+                        // operator who did not mean to publish policies should find out here and
+                        // not from an audit.
+                        if settings.sysvol_share {
+                            println!(
+                                "smb: SYSVOL is mounted read-only, rendered from the policy volume"
+                            );
+                        }
                         Some(running)
                     }
                     Err(detail) => fatal(&i18n::t("error.server", &[("detail", &detail)])),

@@ -12,11 +12,17 @@
 //! `IPC$` and DCE/RPC over them; this module decides the address, the name, the credentials and how
 //! to stop. The same split as the KDC: an engine with no sockets, and a daemon that owns them.
 //!
-//! # Deliberately no file shares
+//! # File shares: one, and only when asked for
 //!
-//! Only `IPC$`. A domain controller in this deployment is an identity service; a share with files in
-//! it would be a second, unreviewed path into the same process, with its own access rules to get
-//! wrong. `IPC$` is created by the library itself and is what a join needs.
+//! `IPC$` is what a join needs, and it is the only share this module mounts unless a deployment
+//! says otherwise. The exception is `SYSVOL`: `smb.sysvol_share` mounts the directory's policies as
+//! the files a member fetches, rendered from the same `groupPolicyContainer` objects the LDAP half
+//! serves, read-only, from a tree built at mount.
+//!
+//! Off by default, and the reason is not caution for its own sake: `smb-server` has no "any
+//! authenticated user" mode, so the share is public read-only - see `sysvol::share` for what that
+//! widens. A second file share would be a second path into a process whose access rules are about
+//! tickets, and it is not added without the same question being answered.
 
 pub mod serve;
 
@@ -109,6 +115,14 @@ pub struct SmbConfig {
     /// with a line naming this setting rather than with "the password is wrong".
     #[serde(default)]
     pub netlogon_des: bool,
+    /// Mount `SYSVOL`: the directory's policies rendered as the files a member fetches.
+    ///
+    /// Off by default, and the reason is in `sysvol::share`: the SMB crate has no "any authenticated
+    /// user" mode, so the share is public read-only, which is wider than a controller's. A
+    /// deployment that turns this on accepts that an anonymous client can read which accounts may
+    /// log on where; one that does not turns it on when the mode exists.
+    #[serde(default)]
+    pub sysvol_share: bool,
 }
 
 /// One account SMB accepts a password for.
@@ -165,6 +179,8 @@ pub struct Settings {
     pub domain_netbios: Option<String>,
     /// Serve the secure channel of a client that offers no AES.
     pub netlogon_des: bool,
+    /// Mount `SYSVOL`, rendering the directory's policies into the files a member fetches.
+    pub sysvol_share: bool,
     /// The port the `netlogon` endpoint answers on, beside `drsuapi_tcp`.
     pub netlogon_tcp: Option<SocketAddr>,
     /// The address a client is told to reach this controller at, when one is configured.
@@ -297,6 +313,7 @@ impl Settings {
                     .map(|label| label.to_ascii_uppercase())
             }),
             netlogon_des: config.netlogon_des,
+            sysvol_share: config.sysvol_share,
         })
     }
 }

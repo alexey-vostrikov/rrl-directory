@@ -34,6 +34,10 @@ pub mod catalog;
 pub mod inf;
 pub mod pol;
 pub mod profiles;
+/// The volume as an SMB share. Present only when SMB is built: a backend for a protocol that is not
+/// compiled is a dependency on nothing.
+#[cfg(feature = "smb")]
+pub mod share;
 
 use std::fmt::Debug;
 
@@ -191,10 +195,13 @@ impl<T: Template> Rendered<T> {
 
 /// The path of a policy's own folder under the share, as a client spells it.
 ///
-/// `<domain>\Policies\{GUID}` - what `gPCFileSysPath` names, minus the share. The domain is not
-/// repeated here because the volume is already scoped to one.
-pub fn policy_root(guid: &str) -> String {
-    format!(r"Policies\{guid}")
+/// `<domain>\Policies\{GUID}` - what `gPCFileSysPath` names, minus the share and the server. The
+/// domain is repeated under the share because that is where a controller keeps it: one `SYSVOL`
+/// serves the whole forest, and `Policies` directly under it would be ambiguous between two domains
+/// on one server. It is not cosmetic - a client appends this to `\\<server>\SYSVOL\` and expects to
+/// find the folder that `gPCFileSysPath` promised.
+pub fn policy_root(domain: &str, guid: &str) -> String {
+    format!(r"{domain}\Policies\{guid}")
 }
 
 /// Whether two paths name the same file.
@@ -277,8 +284,9 @@ mod tests {
     #[test]
     fn a_policy_root_is_the_path_a_client_appends_to_the_share() {
         assert_eq!(
-            policy_root("{31B2F340-016D-11D2-945F-00C04FB984F9}"),
-            r"Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}"
+            policy_root("ad.example.com", "{31B2F340-016D-11D2-945F-00C04FB984F9}"),
+            r"ad.example.com\Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}",
+            "the domain is under the share, as one SYSVOL serves the whole forest"
         );
     }
 

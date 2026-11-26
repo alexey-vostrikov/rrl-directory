@@ -117,6 +117,19 @@ jobs:
             echo "::endgroup::"
           done
 
+      # The fuzz crate is a separate workspace with its own lockfile, and its job runs on a schedule
+      # only - so a `[patch]` pointing at a directory that no longer exists, or a lockfile gone out
+      # of step with its manifest, used to be invisible until the next Monday. That is not
+      # hypothetical: `vendor/rskrb5` was deleted and the patch that named it was left behind, and
+      # fuzzing did not build from the eighth of November until it was found - two scheduled runs
+      # failed in the meantime, one of them burning an hour.
+      #
+      # `cargo check` builds the six targets without running any of them, which costs seconds and
+      # catches everything that breaks before a run starts. The runs themselves stay on the
+      # schedule, because a minute per target is what a pull request should not pay for.
+      - name: the fuzz crate still resolves and builds
+        run: cargo check --all-targets --manifest-path fuzz/Cargo.toml
+
   load:
     runs-on: ubuntu-latest
     timeout-minutes: 30

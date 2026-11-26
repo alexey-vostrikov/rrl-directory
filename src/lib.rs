@@ -86,5 +86,6 @@ pub mod sid;
 /// controller should not answer on the port one uses.
 #[cfg(feature = "smb")]
 pub mod smb;
+pub mod sysvol;
 pub mod tls;
 pub mod yaml_export;

@@ -65,10 +65,13 @@ fn dns_domain(base_dn: &str) -> Option<String> {
 }
 
 /// The policy every domain gets, whose settings a client applies when it finds none of its own.
-pub const DEFAULT_DOMAIN_POLICY: &str = "{31B2F340-016D-11D2-945F-00C04FB984F9}";
+///
+/// The value lives in [`crate::sysvol::profiles`], beside the templates that name the same GUID in
+/// their paths: one constant, re-exported, rather than two that can disagree.
+pub use crate::sysvol::profiles::DEFAULT_DOMAIN_POLICY;
 
 /// The policy that applies to domain controllers themselves.
-pub const DEFAULT_CONTROLLERS_POLICY: &str = "{6AC1786C-016F-11D2-945F-00C04FB984F9}";
+pub use crate::sysvol::profiles::DEFAULT_CONTROLLERS_POLICY;
 
 /// What `displayName` says, in the two spellings Windows and Samba use.
 pub const DEFAULT_DOMAIN_POLICY_NAME: &str = "Default Domain Policy";

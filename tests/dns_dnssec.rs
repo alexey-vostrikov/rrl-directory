@@ -44,9 +44,19 @@ fn now() -> u64 {
 /// fixture in the repository arrives readable by everybody, which is exactly what the loader refuses.
 /// The copy is what makes the check testable rather than a CI failure, and it keeps the production
 /// rule strict: a real signing key on a real host is `0600` or the server will not start.
+///
+/// # Why the copy is staged and renamed
+///
+/// Two tests in this file ask for the same fixture - the algorithm loop and the signer test - and
+/// they run as threads of one process, so they share the directory and race. `fs::copy` creates the
+/// target and then fills it, so the second caller found a file, saw `exists()` true, skipped its own
+/// copy, and read zero bytes: measured as `the file is empty` inside
+/// `every_algorithm_this_build_offers_signs_and_verifies`, one failure in a full run and none when
+/// the file happened to be in place already.
+///
+/// So the bytes go to a name of this call's own first, and `rename` puts them in place in one step.
+/// A reader now sees either no file or the whole key, never a half-written one.
 fn key_file(fixture: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let directory = std::env::temp_dir().join(format!("rrl-dnssec-keys-{}", std::process::id()));
     std::fs::create_dir_all(&directory).expect("a temporary directory");
     let target = directory.join(fixture);
@@ -54,11 +64,42 @@ fn key_file(fixture: &str) -> std::path::PathBuf {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/keys")
             .join(fixture);
-        std::fs::copy(&source, &target).expect("the fixture is committed");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
-            .expect("the mode can be set");
+        publish_private(&source, &target);
     }
     target
+}
+
+/// Puts `source` at `target` readable by this principal only, in one step a reader cannot catch
+/// half-done.
+///
+/// A separate function because the property is worth a test of its own: racing threads call it for
+/// one target and check that none of them ever observes a partial file. Inlined into [`key_file`]
+/// it was two statements that looked right and were not.
+fn publish_private(source: &std::path::Path, target: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // One counter for the process: the staged name has to differ per call, and a thread id does not
+    // name a file (`ThreadId` has no stable spelling and is only `Debug`).
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a file name");
+    let staged = target.with_file_name(format!(
+        ".{name}.{}",
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::copy(source, &staged).expect("the fixture is committed");
+    // The mode goes on the staged file, before anything can open it under the final name: the loader
+    // refuses a key another principal can read, and a window with the wrong mode would be the same
+    // defect in another form.
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
+        .expect("the mode can be set");
+    // A rename inside one directory is atomic: a reader that asked for the fixture either finds it
+    // absent or finds all of it.
+    std::fs::rename(&staged, target).expect("the staged key can take its name");
 }
 
 /// The P-256 key committed beside this test, as PKCS#8 DER.
@@ -835,4 +876,64 @@ async fn ask_dnssec(server: SocketAddr) -> (DNSKEY, RRSIG, Record) {
         .expect("the DNSKEY");
 
     (dnskey, rrsig, record)
+}
+/// A caller that finds the file must find all of it.
+///
+/// This is the shape [`key_file`] has: check whether the fixture is already published, publish it if
+/// not, then read it. Two threads doing that for one target race, and the property they need is not
+/// "the file appears" but "no reader ever sees a partial one".
+///
+/// The race is made probable rather than hoped for: eight threads, released together by a barrier,
+/// over many fresh targets. Without the staging and the rename of [`publish_private`] this test
+/// fails - measured by reverting that function to `fs::copy` straight into the target, which is what
+/// it did before, and reading zero bytes where the key is 185.
+#[test]
+fn a_key_another_thread_is_publishing_is_never_read_half_written() {
+    use std::sync::{Arc, Barrier};
+
+    const THREADS: usize = 8;
+    const ATTEMPTS: usize = 200;
+
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/keys")
+        .join("rrl-dnssec-test-p384.der");
+    let expected = std::fs::metadata(&source)
+        .expect("the fixture is committed")
+        .len();
+    assert!(expected > 0, "a key of zero bytes proves nothing");
+
+    let directory = std::env::temp_dir().join(format!("rrl-dnssec-race-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("a temporary directory");
+
+    for attempt in 0..ATTEMPTS {
+        // A fresh target each round: the race is in the first publication, and a target that already
+        // holds the key has no race left to show.
+        let target = directory.join(format!("key-{attempt}.der"));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let readers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (source, target, barrier) =
+                    (source.clone(), target.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    // Exactly what `key_file` does.
+                    if !target.exists() {
+                        publish_private(&source, &target);
+                    }
+                    std::fs::metadata(&target)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0)
+                })
+            })
+            .collect();
+
+        for reader in readers {
+            let seen = reader.join().expect("a reader that did not panic");
+            assert_eq!(
+                seen, expected,
+                "attempt {attempt}: a reader saw {seen} bytes of a {expected}-byte key"
+            );
+        }
+        let _ = std::fs::remove_file(&target);
+    }
 }

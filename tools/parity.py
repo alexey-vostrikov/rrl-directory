@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Сверка rust-rest-ldap с настоящим gorestldap на одном и том же входе.
+"""Сверка rrl-directory с настоящим gorestldap на одном и том же входе.
 
 Зачем: «полный паритет» — заявление, а не факт, пока его не с чем сверить. Этот скрипт поднимает
 оба сервера на одних и тех же данных, задаёт им одни и те же вопросы и сообщает о расхождениях.
@@ -230,7 +230,7 @@ def main() -> int:
     parser.add_argument("--go-ref", type=Path, help="checkout gorestldap с собранным build/")
     parser.add_argument("--go-url", default="ldap://127.0.0.1:11800")
     parser.add_argument("--rust-url", default="ldap://127.0.0.1:11801")
-    parser.add_argument("--rust-binary", type=Path, default=Path("./rust-rest-ldap"))
+    parser.add_argument("--rust-binary", type=Path, default=Path("./rrl-directory"))
     args = parser.parse_args()
 
     servers = ()

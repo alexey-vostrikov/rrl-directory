@@ -8,7 +8,7 @@
 # file alone and a tool that changes in somebody's checkout cannot silently change a number. All
 # three are pinned to commits, not to branches - a moving ref under a green result is a test
 # suite that stops meaning anything.
-FROM rust-rest-ldap-build:1.99.1
+FROM rrl-directory-build:1.99.1
 
 # llvm-tools is the profiler runtime cargo-llvm-cov instruments against; without it the tool
 # reports "no llvm-tools" and refuses to measure.

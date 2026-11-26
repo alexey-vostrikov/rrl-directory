@@ -1662,7 +1662,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-rest-ldap"
+name = "rrl-directory"
 version = "0.1.0"
 dependencies = [
  "argon2",
@@ -1701,11 +1701,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-rest-ldap-fuzz"
+name = "rrl-directory-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
- "rust-rest-ldap",
+ "rrl-directory",
 ]
 
 [[package]]

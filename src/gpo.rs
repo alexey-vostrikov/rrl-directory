@@ -43,6 +43,15 @@ use crate::model::{Attribute, Entry};
 /// `Settings::resolve` refuses a naming context it cannot spell, and every caller of [`ensure`]
 /// has one that resolved - so `None` here is a naming context with no `dc=` components, which is a
 /// configuration this server does not start with.
+/// The domain a naming context names, for the callers that are not this module.
+///
+/// One spelling of one rule: the share's first folder, the policies' `gPCFileSysPath` and the zone
+/// this server answers for all say the same domain, and a second derivation is a second chance to
+/// disagree.
+pub fn domain_of_dn(base_dn: &str) -> Option<String> {
+    dns_domain(base_dn)
+}
+
 fn dns_domain(base_dn: &str) -> Option<String> {
     #[cfg(feature = "dns")]
     {
@@ -101,18 +110,33 @@ pub fn policy_dn(base_dn: &str, guid: &str) -> String {
 
 /// The share path a client fetches the template from, as AD spells it.
 ///
-/// `\\<domain>\Policies\<GUID>` - a UNC path, not a filesystem one, because that is what the client
-/// uses it as. Lower-cased domain: a share name is matched without case by SMB and by this server,
-/// and one spelling is what makes two policies' paths comparable.
-pub fn file_sys_path(dns_domain: &str, guid: &str) -> String {
-    format!(r"\\{}\Policies\{guid}", dns_domain.to_ascii_lowercase())
+/// `\\<server>\SYSVOL\<domain>\Policies\<GUID>`, which is four components and not two. Each was
+/// missing here once, and the result was a path no client could follow:
+///
+/// - `SYSVOL` is the share. Without it the client opens the share `Policies`, which no server has;
+/// - `<domain>` repeats under the share, because one `SYSVOL` serves the whole forest: `Policies`
+///   alone would be ambiguous between two domains on one controller;
+/// - `<server>` and not the domain name. A domain path - `\\ad.example.com\SYSVOL\...` - is a **DFS
+///   namespace** in AD: the client asks for a referral over `FSCTL_DFS_GET_REFERRALS` and is sent to
+///   a controller. This server does not answer that (`STATUS_FS_DRIVER_REQUIRED`), so a domain path
+///   would name something that does not resolve. The server's own name is a real share, and it is
+///   what the deployment can actually serve today; the domain path returns when DFS does.
+///
+/// Lower-cased throughout: a share name is matched without case by SMB and by this server, and one
+/// spelling is what makes two policies' paths comparable.
+pub fn file_sys_path(server: &str, dns_domain: &str, guid: &str) -> String {
+    format!(
+        r"\\{}\SYSVOL\{}\Policies\{guid}",
+        server.to_ascii_lowercase(),
+        dns_domain.to_ascii_lowercase()
+    )
 }
 
 /// The entries that make a domain's policy container - the ones that are missing, in write order.
 ///
 /// Parent first: a directory refuses a child whose parent is absent, and the order of a `Vec` is the
 /// only thing that says which is which.
-pub fn entries(base_dn: &str, dns_domain: &str) -> Vec<Entry> {
+pub fn entries(base_dn: &str, server: &str, dns_domain: &str) -> Vec<Entry> {
     let container = |dn: String, cn: &str| {
         Entry::new(
             dn,
@@ -144,7 +168,7 @@ pub fn entries(base_dn: &str, dns_domain: &str) -> Vec<Entry> {
                 .push(Attribute::single("displayName", name))
                 .push(Attribute::single(
                     "gPCFileSysPath",
-                    file_sys_path(dns_domain, guid).as_str(),
+                    file_sys_path(server, dns_domain, guid).as_str(),
                 ))
                 // 2 is the version of the Group Policy Editor that made the object, and the only
                 // value a policy with no extensions to name has.
@@ -177,12 +201,34 @@ pub enum Outcome {
     Created(Vec<String>),
 }
 
+/// The name a policy's template path is built from, or why there is none.
+///
+/// Refused rather than defaulted: the name goes into `gPCFileSysPath`, and a path built from an empty
+/// host is `\\\SYSVOL\...` - a policy a client can list and never open, which reads as a broken share
+/// rather than as a missing setting.
+pub fn checked_server(server: &str) -> Result<&str, String> {
+    let trimmed = server.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "a policy names the server its template lives on, and none is configured: set \
+             `cldap.dns_host` (or `smb.dns_domain` with `smb.netbios_name`) so that \
+             `gPCFileSysPath` is a path a client can follow"
+                .to_string(),
+        );
+    }
+    Ok(trimmed)
+}
+
 /// Writes the two default policies if the directory has no policy container.
 ///
 /// All or nothing on the container: a directory with `CN=Policies` and one policy is a half-made
 /// state somebody has to recognise, and it is reachable only by a write that failed halfway - which
 /// the backend makes atomic, so it is not a state this can leave behind.
-pub async fn ensure(source: &crate::reload::Source, base_dn: &str) -> Result<Outcome, String> {
+pub async fn ensure(
+    source: &crate::reload::Source,
+    base_dn: &str,
+    server: &str,
+) -> Result<Outcome, String> {
     if source
         .directory()
         .await
@@ -195,7 +241,8 @@ pub async fn ensure(source: &crate::reload::Source, base_dn: &str) -> Result<Out
     let domain = dns_domain(base_dn).ok_or_else(|| {
         format!("the policies belong to a domain and '{base_dn}' has no dc= components to name one")
     })?;
-    let entries = entries(base_dn, &domain);
+    let server = checked_server(server)?;
+    let entries = entries(base_dn, server, &domain);
     let written = entries.iter().map(|entry| entry.dn().to_string()).collect();
     let changes: Vec<EntryChange> = entries
         .into_iter()
@@ -230,7 +277,7 @@ mod tests {
     #[test]
     fn the_default_policies_are_entries_this_schema_accepts() {
         let schema = schema();
-        for entry in entries(BASE, DOMAIN) {
+        for entry in entries(BASE, "dc1.ad.example.com", DOMAIN) {
             if let Err(violations) = schema.check(&entry) {
                 panic!("{} does not validate: {violations:?}", entry.dn());
             }
@@ -240,7 +287,7 @@ mod tests {
     /// The two names every domain has, in the spelling AD's tools print.
     #[test]
     fn the_two_default_policies_are_the_ones_windows_makes() {
-        let policies = entries(BASE, DOMAIN);
+        let policies = entries(BASE, "dc1.ad.example.com", DOMAIN);
         let names: Vec<&str> = policies
             .iter()
             .filter_map(|entry| {
@@ -263,11 +310,33 @@ mod tests {
         );
     }
 
-    /// The directory's version and the template's `Version=` are one number, or a client skips the
-    /// policy without saying so.
+    /// The path is spelled out in full, character for character.
+    ///
+    /// The version of this test before it checked `starts_with(r"\\ad.example.com\")` and
+    /// `ends_with(r"Policies\{GUID}")`, which are both true of a path that is missing `SYSVOL` and
+    /// the domain that repeats under it - and a client cannot follow that path at all. A test of the
+    /// two ends of a string says nothing about its middle, so this one states the whole thing.
+    #[test]
+    fn the_path_is_the_one_a_client_can_follow() {
+        assert_eq!(
+            file_sys_path("dc1.ad.example.com", DOMAIN, DEFAULT_DOMAIN_POLICY),
+            r"\\dc1.ad.example.com\SYSVOL\ad.example.com\Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}",
+            "share, domain under the share, then Policies"
+        );
+        // A path built from the domain name is a DFS namespace, which this server does not answer:
+        // `FSCTL_DFS_GET_REFERRALS` returns STATUS_FS_DRIVER_REQUIRED. Named here so that the reason
+        // the server's name is used is in the test and not only in a commit message.
+        assert!(
+            !file_sys_path("dc1.ad.example.com", DOMAIN, DEFAULT_DOMAIN_POLICY)
+                .starts_with(r"\\ad.example.com\SYSVOL"),
+            "the domain would need DFS, and this server does not serve one"
+        );
+    }
+
+    /// The version and the path name one GUID, and the path carries the server it lives on.
     #[test]
     fn the_version_is_zero_and_the_path_names_the_same_guid() {
-        for entry in entries(BASE, DOMAIN) {
+        for entry in entries(BASE, "dc1.ad.example.com", DOMAIN) {
             let Some(version) = entry
                 .attributes()
                 .get("versionNumber")
@@ -286,21 +355,36 @@ mod tests {
                 .get("cn")
                 .and_then(|attribute| attribute.values.first())
                 .expect("a policy is named by its GUID");
-            assert!(
-                path.ends_with(&format!(r"Policies\{guid}")),
-                "the path and the GUID agree: {path} against {guid}"
+            assert_eq!(
+                path,
+                &file_sys_path("dc1.ad.example.com", DOMAIN, guid),
+                "the path is built by the one function that knows its shape"
             );
             assert!(
-                path.starts_with(r"\\ad.example.com\"),
-                "the path is the share as a client addresses it: {path}"
+                path.contains(r"\SYSVOL\"),
+                "the share is named, and without it a client asks for a share `Policies`: {path}"
             );
         }
+    }
+
+    /// A missing server name is refused, not turned into `\\\SYSVOL\...`.
+    #[test]
+    fn a_policy_without_a_server_name_is_refused() {
+        let error = checked_server("  ").expect_err("an empty host is not a host");
+        assert!(
+            error.contains("gPCFileSysPath"),
+            "the refusal says what the value is for: {error}"
+        );
+        assert_eq!(
+            checked_server(" dc1.ad.example.com ").expect("a name, with the space trimmed"),
+            "dc1.ad.example.com"
+        );
     }
 
     /// The container comes before what it holds: a directory refuses a child whose parent is absent.
     #[test]
     fn the_parents_are_written_first() {
-        let dns: Vec<String> = entries(BASE, DOMAIN)
+        let dns: Vec<String> = entries(BASE, "dc1.ad.example.com", DOMAIN)
             .iter()
             .map(|entry| entry.dn().to_string())
             .collect();

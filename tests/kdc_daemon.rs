@@ -84,7 +84,12 @@ fn settings(realm: &str) -> Settings {
         port: Some(0),
         master_key_file: None,
     };
-    Settings::resolve(&config, BASE_DN, IpAddr::V4(Ipv4Addr::LOCALHOST)).expect("settings")
+    Settings::resolve(&config, BASE_DN, IpAddr::V4(Ipv4Addr::LOCALHOST))
+        // What `main.rs` does: the name goes into the PAC and into `gPCFileSysPath`, and a realm
+        // provisioned without it is a realm whose policies name no server. Set here rather than
+        // defaulted there, because a controller with no name is a deployment this server refuses.
+        .expect("settings")
+        .with_logon_server("dc1.ad.example.com")
 }
 
 fn master_file(dir: &std::path::Path) -> std::path::PathBuf {

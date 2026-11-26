@@ -306,7 +306,7 @@ pub async fn start(
     // `groupPolicyContainer` before it fetches any template, so a controller without them answers
     // `gpresult /r` with nothing at all - which reads as an unmanaged domain rather than as a policy
     // that was never made. The template half is the policy share, which this build does not serve.
-    match crate::gpo::ensure(&source, &base_dn).await? {
+    match crate::gpo::ensure(&source, &base_dn, &settings.logon_server).await? {
         crate::gpo::Outcome::Created(dns) => {
             for dn in dns {
                 eprintln!("gpo: provisioned {dn}");

@@ -51,6 +51,44 @@ if [ -n "${RR_LDAP_EXTRA_MOUNT:-}" ]; then
     done
 fi
 
+# `RR_LDAP_DEBUG`: how much debug info the build carries. Measured on one test binary of this
+# repository, 312M with the default:
+#
+#     all `.debug_*` sections    247M   (79% of the file)
+#     `.debug_line` alone         21M   (the file:line a backtrace needs)
+#     stripped                   64M   (4.9x smaller)
+#
+# So `line-tables-only` keeps a failing test's backtrace with file and line, drops what a debugger
+# would show for variables, and is about a quarter of the size. `RR_LDAP_DEBUG=2` restores the full
+# default for a session that is chasing a defect through a debugger; `RR_LDAP_DEBUG=0` is the
+# smallest and gives the build's own panic messages nothing to point at.
+debug_level="${RR_LDAP_DEBUG:-line-tables-only}"
+
+# `CARGO_INCREMENTAL=0`: with the target directory mounted from the host and the toolchain in a
+# container, incremental state is rewritten whenever anything about the mount changes and is not
+# shared between the feature combinations this repository tests. Measured: 5.7G of a 52G target
+# directory, for a saving no run ever collected. `RR_LDAP_INCREMENTAL=1` turns it back on.
+#
+# `RR_LDAP_PRUNE` (default on): after the command, `scripts/cargo-prune.sh` removes artifacts no run
+# has written in `RR_LDAP_PRUNE_AGE` days (default 3) and the incremental tree. `cargo` never deletes
+# an artifact it is no longer asked for, and every feature combination is a separate hash, so
+# without this the directory only grows. `RR_LDAP_PRUNE=no` disables it for a run that is measuring
+# cold-build time.
+incremental="${RR_LDAP_INCREMENTAL:-0}"
+prune="${RR_LDAP_PRUNE:-yes}"
+prune_age="${RR_LDAP_PRUNE_AGE:-3}"
+
+# `ionice`: the build yields I/O bandwidth to everything else, so a twelve-minute test run does not
+# make the machine unusable for whoever is using it. A flag string rather than a class, because the
+# right one depends on the disk: `-c2 -n7` is best-effort at the lowest priority and still gets
+# bandwidth when nothing else wants it, `-c3` is idle and gets none while anything else does - which
+# on a busy disk turns a build into a stall. The comment is here because the effect is not obvious:
+# I/O priorities are applied by the block scheduler, and a device with `none` (many NVMe drives, this
+# one included) ignores them entirely. It is still set: it costs nothing, it applies on the hosts
+# where the scheduler does honour it, and it is inherited by every compiler and test process the
+# build spawns.
+ionice_flags="${RR_LDAP_IONICE:--c2 -n7}"
+
 exec docker run --rm \
   -v "$repo:/w" \
   ${extra_mounts} \
@@ -62,5 +100,30 @@ exec docker run --rm \
   -e CARGO_HOME=/cargo \
   -e CARGO_TARGET_DIR=/target \
   -e CARGO_TERM_COLOR=never \
+  -e "CARGO_INCREMENTAL=$incremental" \
+  -e "CARGO_PROFILE_DEV_DEBUG=$debug_level" \
+  -e "CARGO_PROFILE_TEST_DEBUG=$debug_level" \
+  -e "RR_LDAP_PRUNE=$prune" \
+  -e "RR_LDAP_PRUNE_AGE=$prune_age" \
+  -e "RR_LDAP_IONICE=$ionice_flags" \
   -e "MIRIFLAGS=${MIRIFLAGS:-}" \
-  "$IMAGE" cargo "$@"
+  "$IMAGE" sh -c '
+    # `ionice` where it is available and permitted, the command alone where it is not: a build that
+    # refuses to start because a priority could not be set would be worse than a build that competes
+    # for the disk.
+    #
+    # shellcheck disable=SC2086 # a flag string, word-split on purpose
+    if ionice $RR_LDAP_IONICE true 2>/dev/null; then
+      set -- ionice $RR_LDAP_IONICE "$@"
+    fi
+    "$@"
+    status=$?
+    # After the command, and whatever it did: a run that failed has already written the artifacts of
+    # the units it got through, and those are the ones that accumulate. The prune deletes thousands
+    # of files, so it carries the same priority.
+    case "${RR_LDAP_PRUNE:-yes}" in
+      no | NO | 0 | false) ;;
+      *) ionice $RR_LDAP_IONICE /w/scripts/cargo-prune.sh "$RR_LDAP_PRUNE_AGE" >&2 || true ;;
+    esac
+    exit $status
+  ' sh cargo "$@"

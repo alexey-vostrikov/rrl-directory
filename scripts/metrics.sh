@@ -54,4 +54,15 @@ exec docker run --rm \
   -e RUSTUP_HOME=/rustup \
   -e CARGO_TARGET_DIR=/target \
   -e CARGO_TERM_COLOR=never \
-  "$image" "$tool" "$@"
+  -e "RR_LDAP_IONICE=${RR_LDAP_IONICE:--c2 -n7}" \
+  "$image" sh -c '
+    # The same I/O priority as the build it measures: `llvm-cov` runs the whole test suite, so it is
+    # the same flood, and a measurement taken while the machine is unusable is a measurement nobody
+    # takes twice.
+    #
+    # shellcheck disable=SC2086 # a flag string, word-split on purpose
+    if ionice $RR_LDAP_IONICE true 2>/dev/null; then
+      set -- ionice $RR_LDAP_IONICE "$@"
+    fi
+    exec "$@"
+  ' sh "$tool" "$@"

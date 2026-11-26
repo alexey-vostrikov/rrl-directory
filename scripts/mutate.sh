@@ -81,9 +81,22 @@ for name in "$@"; do
     -e RUSTUP_HOME=/rustup \
     -e CARGO_TARGET_DIR=/target \
     -e CARGO_TERM_COLOR=never \
+    -e "RR_LDAP_IONICE=${RR_LDAP_IONICE:--c2 -n7}" \
     -e PATH=/opt/venv-tools/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin \
     "$image" \
-    python3 -m mutator --root /w $sources \
+    sh -c '
+      # `ionice` on the mutator, and through it on every mutant: an I/O priority is inherited across
+      # fork and exec, so the `cargo test` that each mutant runs carries the same one - and that is
+      # the process that floods the disk, thousands of times over. Set on the mutator alone, a
+      # mutation run is exactly the workload that makes a machine unusable.
+      #
+      # shellcheck disable=SC2086 # a flag string, word-split on purpose
+      if ionice $RR_LDAP_IONICE true 2>/dev/null; then
+        exec ionice $RR_LDAP_IONICE python3 -m mutator "$@"
+      fi
+      exec python3 -m mutator "$@"
+    ' sh \
+      --root /w $sources \
       --use-existing-coverage --mutate-all --max-workers 1 \
       --test-command "cargo test --all-targets --quiet" \
       "/w/$name" 2>&1 | tail -25

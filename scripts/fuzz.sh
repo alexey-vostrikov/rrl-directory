@@ -39,6 +39,17 @@ exec docker run --rm \
   -e RUSTUP_HOME=/rustup \
   -e CARGO_TARGET_DIR=/target \
   -e CARGO_TERM_COLOR=never \
+  -e "RR_LDAP_IONICE=${RR_LDAP_IONICE:--c2 -n7}" \
   "$IMAGE" \
+  sh -c '
+    # A fuzzer writes a corpus file per input it saves and reads the coverage map continuously: it is
+    # the heaviest I/O in this repository after the mutator, so it carries the same priority.
+    #
+    # shellcheck disable=SC2086 # a flag string, word-split on purpose
+    if ionice $RR_LDAP_IONICE true 2>/dev/null; then
+      set -- ionice $RR_LDAP_IONICE "$@"
+    fi
+    exec "$@"
+  ' sh \
   cargo +nightly fuzz run "$TARGET" "fuzz/corpus/$TARGET" -- \
   -max_total_time="$SECONDS_TO_RUN" -artifact_prefix=/w/fuzz/artifacts/

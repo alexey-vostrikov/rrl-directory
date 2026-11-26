@@ -63,6 +63,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `smbclient`, because the share test drives the client Samba ships against the share this code
+      # serves, and a client written by the same hand proves nothing about either. Without it the
+      # test skips - and its own skip is a `return`, so the suite reports `ok` for a test that never
+      # opened a connection. That is the failure mode this step removes: not a red build, a green one
+      # that checked nothing.
+      #
+      # Not from the toolchain image: `docker/toolchain.Dockerfile` is shared with six other projects
+      # and no workflow uses it - CI builds on this runner with `dtolnay/rust-toolchain`. The image
+      # carries `smbclient` too, for local runs through `scripts/cargo.sh`.
+      - name: a real SMB client, for the test that needs one
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends smbclient
+
       - name: formatting
         run: cargo fmt --all -- --check
 

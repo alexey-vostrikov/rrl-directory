@@ -105,6 +105,16 @@ fn run(port: u16, user: Option<&str>, command: &str) -> (bool, String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_real_client_reads_a_policy_over_smb_and_an_anonymous_one_does_not() {
     let Some(version) = smbclient() else {
+        // A skip, except where a skip is the defect. The whole point of this test is that a client
+        // somebody else wrote can reach the share; if it quietly returns, the suite reports `ok` for
+        // a test that opened nothing, which is worse than a red build. CI installs `smbclient`
+        // (`.github/workflows/checks.yml`) and sets `CI`, so there the absence is a failure.
+        if std::env::var_os("CI").is_some() {
+            panic!(
+                "smbclient is not installed and CI is set: the share test cannot be skipped here, \
+                 because a skipped test that reports `ok` is how this test proved nothing before"
+            );
+        }
         eprintln!("skipping: smbclient is not installed, so nothing was proved about the share");
         return;
     };

@@ -19,10 +19,12 @@
 //! the files a member fetches, rendered from the same `groupPolicyContainer` objects the LDAP half
 //! serves, read-only, from a tree built at mount.
 //!
-//! Off by default, and the reason is not caution for its own sake: `smb-server` has no "any
-//! authenticated user" mode, so the share is public read-only - see `sysvol::share` for what that
-//! widens. A second file share would be a second path into a process whose access rules are about
-//! tickets, and it is not added without the same question being answered.
+//! Off by default, and the reason is not caution for its own sake: a share is a second path into a
+//! process whose access rules are about tickets, so it is mounted when a deployment asks for it.
+//! When mounted it runs in `AuthenticatedReadOnly` - an anonymous session is refused and every
+//! logged-on account may read, which is what `NETLOGON` and `SYSVOL` are in AD and what a member
+//! needs with the ticket it already holds. A second file share would be a second path into the same
+//! process and is not added without the same question being answered.
 
 pub mod serve;
 
@@ -117,10 +119,13 @@ pub struct SmbConfig {
     pub netlogon_des: bool,
     /// Mount `SYSVOL`: the directory's policies rendered as the files a member fetches.
     ///
-    /// Off by default, and the reason is in `sysvol::share`: the SMB crate has no "any authenticated
-    /// user" mode, so the share is public read-only, which is wider than a controller's. A
-    /// deployment that turns this on accepts that an anonymous client can read which accounts may
-    /// log on where; one that does not turns it on when the mode exists.
+    /// Off by default, and the reason is not caution for its own sake: a share is a second path
+    /// into a process whose access rules are about tickets, so it is mounted when a deployment asks
+    /// for it rather than always. When mounted it is `AuthenticatedReadOnly` - anonymous sessions
+    /// are refused, every logged-on account may read, and nothing may be written - so a member
+    /// fetches its policies with the ticket it already has and an unauthenticated client learns
+    /// nothing. That mode did not exist in `smb-server` when this setting was written; it does now,
+    /// and the setting no longer widens access beyond the domain.
     #[serde(default)]
     pub sysvol_share: bool,
 }

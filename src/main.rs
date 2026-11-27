@@ -1386,7 +1386,8 @@ async fn serve() {
                 // snapshot and not from a number read at start, so that the `Version=` a client
                 // compares is the `versionNumber` of the entry that snapshot holds - the two
                 // disagreeing is a policy a client skips without an error anywhere.
-                let shares = if settings.sysvol_share {
+                let mut shares = Vec::new();
+                if settings.sysvol_share {
                     let directory = source.directory().await;
                     // The domain under the share, from the same rule that names the policies' paths:
                     // `gPCFileSysPath` and this folder have to agree, or a client walks to a folder
@@ -1406,12 +1407,56 @@ async fn serve() {
                     );
                     let volume: std::sync::Arc<dyn rrl_directory::sysvol::Volume> =
                         std::sync::Arc::new(volume);
-                    vec![rrl_directory::sysvol::share::share(
+                    shares.push(rrl_directory::sysvol::share::share(
                         volume, "SYSVOL", &domain,
-                    )]
-                } else {
-                    Vec::new()
-                };
+                    ));
+                }
+
+                // `NETLOGON`: the logon scripts, from a directory an administrator keeps rather than
+                // from the policies. Three refusals at start, because each of them otherwise shows up
+                // as a client that logs on and runs nothing:
+                //
+                //   * the path given is not a directory - a file, or a path that was renamed;
+                //   * the directory cannot be opened - a permission the daemon lacks;
+                //   * it opens but lists nothing - a mount that has not been mounted yet.
+                //
+                // The third is a judgement rather than a rule, and it is the one worth stating: an
+                // empty NETLOGON is indistinguishable, from the client's side, from a share that
+                // serves the wrong folder, and the cheap way to tell them apart is to refuse at
+                // start and name the path. A deployment that genuinely wants an empty share can
+                // create a placeholder file.
+                if let Some(dir) = &settings.netlogon_dir {
+                    match std::fs::read_dir(dir) {
+                        Ok(entries) => {
+                            if entries.count() == 0 {
+                                fatal(&format!(
+                                    "NETLOGON: {} is an empty directory. A share that lists nothing \
+                                     is a client that logs on and runs no scripts, which is \
+                                     indistinguishable from a wrong path - put a file in it, or \
+                                     remove smb.netlogon_dir",
+                                    dir.display()
+                                ));
+                            }
+                        }
+                        Err(err) => fatal(&format!(
+                            "NETLOGON: {} cannot be read: {err}",
+                            dir.display()
+                        )),
+                    }
+                    let backend = match smb_server::LocalFsBackend::new(dir) {
+                        Ok(backend) => backend,
+                        Err(err) => fatal(&format!(
+                            "NETLOGON: {} cannot be opened as a share root: {err}",
+                            dir.display()
+                        )),
+                    };
+                    shares.push(
+                        smb_server::Share::new("NETLOGON", backend.read_only())
+                            // The mode AD gives the LOGON share: any principal that logged on may
+                            // read, nobody may write, an anonymous session is refused.
+                            .authenticated_read_only(),
+                    );
+                }
 
                 match rrl_directory::smb::serve::start(
                     &settings,

@@ -125,7 +125,7 @@ rrl-kdc = { git = "https://github.com/alexey-vostrikov/rrl-kdc", branch = "main"
 # `ipc` is named beside `krb5` because it is off by default: the pipes - `IPC$`, its named channels
 # and the DCE/RPC on them - are the whole reason this daemon runs an SMB server at all, and a build
 # that left them out would answer `BAD_NETWORK_NAME` to the first thing a join asks for.
-smb-server = { git = "https://github.com/alexey-vostrikov/rrl-smb", branch = "main", optional = true, default-features = false, features = ["krb5", "ipc"] }
+smb-server = { git = "https://github.com/alexey-vostrikov/rrl-smb", branch = "main", optional = true, default-features = false, features = ["krb5", "ipc", "localfs"] }
 
 # Logging. `tracing` without a subscriber records nothing, and the call sites look instrumented
 # either way - which is how a refusal in the RPC dispatcher came to be invisible. The subscriber

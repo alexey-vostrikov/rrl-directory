@@ -12,19 +12,25 @@
 //! `IPC$` and DCE/RPC over them; this module decides the address, the name, the credentials and how
 //! to stop. The same split as the KDC: an engine with no sockets, and a daemon that owns them.
 //!
-//! # File shares: one, and only when asked for
+//! # File shares: two, and only when asked for
 //!
 //! `IPC$` is what a join needs, and it is the only share this module mounts unless a deployment
-//! says otherwise. The exception is `SYSVOL`: `smb.sysvol_share` mounts the directory's policies as
-//! the files a member fetches, rendered from the same `groupPolicyContainer` objects the LDAP half
-//! serves, read-only, from a tree built at mount.
+//! says otherwise. Two settings add a file share:
 //!
-//! Off by default, and the reason is not caution for its own sake: a share is a second path into a
-//! process whose access rules are about tickets, so it is mounted when a deployment asks for it.
-//! When mounted it runs in `AuthenticatedReadOnly` - an anonymous session is refused and every
-//! logged-on account may read, which is what `NETLOGON` and `SYSVOL` are in AD and what a member
-//! needs with the ticket it already holds. A second file share would be a second path into the same
-//! process and is not added without the same question being answered.
+//!   * `smb.sysvol_share` mounts `SYSVOL`: the directory's policies rendered as the files a member
+//!     fetches, from the same `groupPolicyContainer` objects the LDAP half serves, read-only, from a
+//!     tree built at mount. A snapshot, because a policy is compared by version before it is applied
+//!     and one rebuild point is the honest shape.
+//!   * `smb.netlogon_dir` mounts `NETLOGON`: the logon scripts, from a directory on disk, read live.
+//!     In AD both names are the same folder - `scripts` inside `SYSVOL` - but a logon script is a
+//!     file an administrator edits, and a snapshot would report a script as missing until the next
+//!     rebuild.
+//!
+//! Both are off by default, and the reason is not caution for its own sake: a share is a second path
+//! into a process whose access rules are about tickets, so it is mounted when a deployment asks for
+//! it. Both run in `AuthenticatedReadOnly` - an anonymous session is refused and every logged-on
+//! account may read, which is what these folders are in AD and what a member needs with the ticket it
+//! already holds.
 
 pub mod serve;
 
@@ -128,6 +134,23 @@ pub struct SmbConfig {
     /// and the setting no longer widens access beyond the domain.
     #[serde(default)]
     pub sysvol_share: bool,
+    /// Mount `NETLOGON` from this directory: the logon scripts a member runs, as files.
+    ///
+    /// In AD `NETLOGON` is the `scripts` folder *inside* `SYSVOL`, and the scripts there are files,
+    /// not directory entries - which is why this cannot be rendered from the policies the way
+    /// `SYSVOL` is. The contents come from a directory instead, and that is the whole reason the key
+    /// exists: a logon script is something an administrator edits in an editor and drops in, and a
+    /// directory is how that keeps working.
+    ///
+    /// Read live from disk, deliberately, where `SYSVOL` is a snapshot: a policy governs a machine
+    /// and is compared by version before it is applied, so a snapshot with one rebuild point is the
+    /// honest shape. A logon script is fetched by name at logon with nothing to compare, so a stale
+    /// listing reads as "the file is not there" seconds after it was written.
+    ///
+    /// A missing directory is refused at start rather than mounted empty: a share a client walks
+    /// into and finds nothing is a logon that silently runs no scripts.
+    #[serde(default)]
+    pub netlogon_dir: Option<PathBuf>,
 }
 
 /// One account SMB accepts a password for.
@@ -186,6 +209,12 @@ pub struct Settings {
     pub netlogon_des: bool,
     /// Mount `SYSVOL`, rendering the directory's policies into the files a member fetches.
     pub sysvol_share: bool,
+    /// Where the `NETLOGON` scripts are on disk, when the share is mounted.
+    ///
+    /// The daemon checks the directory here rather than in [`SmbConfig`]: resolution runs before the
+    /// daemon has a place to report a refusal, and a settings object that carries a path the mount
+    /// cannot open is a share that fails at the first client instead of at start.
+    pub netlogon_dir: Option<PathBuf>,
     /// The port the `netlogon` endpoint answers on, beside `drsuapi_tcp`.
     pub netlogon_tcp: Option<SocketAddr>,
     /// The address a client is told to reach this controller at, when one is configured.
@@ -319,6 +348,7 @@ impl Settings {
             }),
             netlogon_des: config.netlogon_des,
             sysvol_share: config.sysvol_share,
+            netlogon_dir: config.netlogon_dir.clone(),
         })
     }
 }
@@ -382,6 +412,27 @@ mod tests {
             Settings::resolve(&config(), Ipv4Addr::LOCALHOST.into(), Some("SAMBA")).expect("ok");
         assert_eq!(settings.bind.port(), 445);
         assert_eq!(settings.netbios_name, "SAMBA");
+    }
+
+    #[test]
+    fn a_netlogon_directory_survives_resolution() {
+        // The path is carried rather than checked here: resolution runs before the daemon can report
+        // a refusal, so the check that the directory exists and lists something happens where a
+        // message reaches the operator. A `drop` of this field in `resolve` would be silent - the
+        // share simply would not mount - so the field is asserted on.
+        let with_dir = SmbConfig {
+            netlogon_dir: Some(PathBuf::from("/srv/netlogon")),
+            ..config()
+        };
+        let settings =
+            Settings::resolve(&with_dir, Ipv4Addr::LOCALHOST.into(), Some("SAMBA")).expect("ok");
+        assert_eq!(settings.netlogon_dir, Some(PathBuf::from("/srv/netlogon")));
+
+        // And absent stays absent: a deployment that mounts no scripts must not get a share at a
+        // default path nobody wrote down.
+        let settings =
+            Settings::resolve(&config(), Ipv4Addr::LOCALHOST.into(), Some("SAMBA")).expect("ok");
+        assert_eq!(settings.netlogon_dir, None);
     }
 
     #[test]
